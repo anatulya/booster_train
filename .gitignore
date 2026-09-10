@@ -72,3 +72,5 @@ tests/
 
 booster_assets
 *.mp4
+
+.vscode
