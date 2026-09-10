@@ -20,16 +20,16 @@ class FlatEnvCfg(TrackingEnvCfg):
 
         self.scene.robot = ROBOT_CFG.replace(prim_path="{ENV_REGEX_NS}/Robot")
         self.actions.joint_pos.scale = K1_ACTION_SCALE
-        self.commands.motion.motion_file = f"{BOOSTER_ASSETS_DIR}/motions/K1/sub4_smallbox_047.npz"
+        self.commands.motion.motion_file = f"{BOOSTER_ASSETS_DIR}/motions/K1/sub4_smallbox_047_hold.npz"
         self.commands.motion.anchor_body_name = "Trunk"
         # Keep the episode within one pass of the motion. The base cfg uses 10.0 s, which is
         # longer than this reference and would wrap the playhead mid-episode.
-        self.episode_length_s = MOTION_FRAMES / MOTION_FPS
+        # self.episode_length_s = MOTION_FRAMES / MOTION_FPS
         # Must stay well below MOTION_FRAMES: max_reset_frame = time_step_total - tail_len,
         # so a large value (mj_dance_004 uses 400) would drive it negative on a 349 frame
         # motion and break the adaptive sampler's bin count.
-        self.commands.motion.tail_len = 0
-        self.commands.motion.adaptive_uniform_ratio = 0.1
+        # self.commands.motion.tail_len = 0
+        # self.commands.motion.adaptive_uniform_ratio = 0.1
         self.commands.motion.body_names = [
             'Trunk',
             'Head_2',

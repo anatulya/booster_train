@@ -28,12 +28,12 @@ import booster_train.tasks.manager_based.beyond_mimic.mdp as mdp
 ##
 
 VELOCITY_RANGE = {
-    "x": (-0.5, 0.5),
-    "y": (-0.5, 0.5),
-    "z": (-0.2, 0.2),
-    "roll": (-0.52, 0.52),
-    "pitch": (-0.52, 0.52),
-    "yaw": (-0.78, 0.78),
+    "x": (-0.7, 0.7),
+    "y": (-0.7, 0.7),
+    "z": (-0.4, 0.4),
+    "roll": (-0.7, 0.7),
+    "pitch": (-0.7, 0.7),
+    "yaw": (-0.9, 0.9),
 }
 
 
@@ -230,7 +230,7 @@ class RewardsCfg:
         weight=1.0,
         params={"command_name": "motion", "std": 3.14},
     )
-    action_rate_l2 = RewTerm(func=mdp.action_rate_l2, weight=-1.0)
+    action_rate_l2 = RewTerm(func=mdp.action_rate_l2, weight=-2.0)
     joint_limit = RewTerm(
         func=mdp.joint_pos_limits,
         weight=-10.0,
@@ -249,47 +249,46 @@ class RewardsCfg:
             "threshold": 1.0,
         },
     )
-
     motion_foot_ori = RewTerm(
         func=mdp.motion_relative_body_orientation_error_exp,
         weight=15.0,
         params={"command_name": "motion", "std": 0.2, "body_names": ["left_foot_link", "right_foot_link"]},
     )
 
-    # motion_foot_pitch_penalty = RewTerm(
-    #     func=mdp.motion_relative_body_pitch_error_l2,
-    #     weight=-1.0, 
-    #     params={"command_name": "motion", "body_names": ["left_foot_link", "right_foot_link"]},
-    # ) 
+    motion_foot_pos = RewTerm(
+        func=mdp.motion_relative_body_position_error_exp,
+        weight=30.0,
+        params={"command_name": "motion", "std": 0.2, "body_names": ["left_foot_link", "right_foot_link"]},
+    )
 
     motion_hand_ori = RewTerm(
         func=mdp.motion_relative_body_orientation_error_exp,
-        weight=3.0,
+        weight=10.0,
         params={"command_name": "motion", "std": 0.2, "body_names": ["left_hand_link", "right_hand_link"]},
-    )
-
-    motion_foot_pos = RewTerm(
-        func=mdp.motion_relative_body_position_error_exp,
-        weight=15.0,
-        params={"command_name": "motion", "std": 0.2, "body_names": ["left_foot_link", "right_foot_link"]},
     )
 
     motion_hand_pos = RewTerm(
         func=mdp.motion_relative_body_position_error_exp,
-        weight=8.0,
+        weight=15.0,
         params={"command_name": "motion", "std": 0.2, "body_names": ["left_hand_link", "right_hand_link"]},
     )
 
     motion_trunk_ori = RewTerm(
         func=mdp.motion_relative_body_orientation_error_exp,
-        weight=10.0,
+        weight=30.0,
         params={"command_name": "motion", "std": 0.2, "body_names": ["Trunk"]},
-    )  
+    )
 
     motion_trunk_pos = RewTerm(
         func=mdp.motion_relative_body_position_error_exp,
         weight=20.0,
         params={"command_name": "motion", "std": 0.2, "body_names": ["Trunk"]},
+    )
+
+    motion_trunk_ang_vel = RewTerm(
+        func=mdp.motion_global_body_angular_velocity_error_exp,
+        weight=5.0,
+        params={"command_name": "motion", "std": 3.14, "body_names": ["Trunk"]},
     )
 
 
