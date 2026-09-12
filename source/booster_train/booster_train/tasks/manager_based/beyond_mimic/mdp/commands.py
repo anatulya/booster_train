@@ -8,18 +8,21 @@ from collections.abc import Sequence
 from dataclasses import MISSING
 from typing import TYPE_CHECKING
 
-from isaaclab.assets import Articulation
+from isaaclab.assets import Articulation, RigidObject
 from isaaclab.managers import CommandTerm, CommandTermCfg
 from isaaclab.markers import VisualizationMarkers, VisualizationMarkersCfg
 from isaaclab.markers.config import FRAME_MARKER_CFG
 from isaaclab.utils import configclass
 from isaaclab.utils.math import (
+    matrix_from_quat,
     quat_apply,
+    quat_apply_inverse,
     quat_error_magnitude,
     quat_from_euler_xyz,
     quat_inv,
     quat_mul,
     sample_uniform,
+    subtract_frame_transforms,
     yaw_quat,
 )
 
@@ -65,6 +68,13 @@ class MotionLoader:
         self.time_step_total = self.joint_pos.shape[0]
         self.tail_len = tail_len
 
+        self.has_object = "object_pos_w" in data
+        if self.has_object:
+            self._object_pos_w = torch.tensor(data["object_pos_w"], dtype=torch.float32, device=device)
+            self._object_quat_w = torch.tensor(data["object_quat_w"], dtype=torch.float32, device=device)
+            self._object_lin_vel_w = torch.tensor(data["object_lin_vel_w"], dtype=torch.float32, device=device)
+            self._object_ang_vel_w = torch.tensor(data["object_ang_vel_w"], dtype=torch.float32, device=device)
+
     @property
     def body_pos_w(self) -> torch.Tensor:
         return self._body_pos_w[:, self._body_indexes]
@@ -84,6 +94,22 @@ class MotionLoader:
     @property
     def max_reset_frame(self) -> int:
         return self.time_step_total - self.tail_len
+
+    @property
+    def object_pos_w(self) -> torch.Tensor:
+        return self._object_pos_w
+
+    @property
+    def object_quat_w(self) -> torch.Tensor:
+        return self._object_quat_w
+
+    @property
+    def object_lin_vel_w(self) -> torch.Tensor:
+        return self._object_lin_vel_w
+
+    @property
+    def object_ang_vel_w(self) -> torch.Tensor:
+        return self._object_ang_vel_w
 
 
 class MotionCommand(CommandTerm):
@@ -109,6 +135,9 @@ class MotionCommand(CommandTerm):
             default_motion_joint_names=default_motion_joint_names,
             tail_len=self.cfg.tail_len, device=self.device
         )
+        self.has_object = self.motion.has_object and self.cfg.object_asset_name is not None
+        if self.has_object:
+            self.object: RigidObject = env.scene[self.cfg.object_asset_name]
         self.time_steps = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
         self.body_pos_relative_w = torch.zeros(self.num_envs, len(cfg.body_names), 3, device=self.device)
         self.body_quat_relative_w = torch.zeros(self.num_envs, len(cfg.body_names), 4, device=self.device)
@@ -136,7 +165,21 @@ class MotionCommand(CommandTerm):
 
     @property
     def command(self) -> torch.Tensor:  # TODO Consider again if this is the best observation
-        return torch.cat([self.joint_pos, self.joint_vel], dim=1)
+        terms = [self.joint_pos, self.joint_vel]
+        if self.has_object:
+            # Anchored to the *reference* root, not the measured one, so the whole term stays a
+            # pure function of (motion file, time_steps): no state-estimation error to model, and
+            # the per-env origin offset cancels out of the subtraction.
+            object_pos, object_quat = subtract_frame_transforms(
+                self.anchor_pos_w, self.anchor_quat_w, self.object_pos_w, self.object_quat_w
+            )
+            terms += [
+                object_pos,
+                matrix_from_quat(object_quat)[..., :2].reshape(self.num_envs, -1),
+                quat_apply_inverse(self.anchor_quat_w, self.object_lin_vel_w),
+                quat_apply_inverse(self.anchor_quat_w, self.object_ang_vel_w),
+            ]
+        return torch.cat(terms, dim=1)
 
     @property
     def joint_pos(self) -> torch.Tensor:
@@ -161,6 +204,22 @@ class MotionCommand(CommandTerm):
     @property
     def body_ang_vel_w(self) -> torch.Tensor:
         return self.motion.body_ang_vel_w[self.time_steps]
+
+    @property
+    def object_pos_w(self) -> torch.Tensor:
+        return self.motion.object_pos_w[self.time_steps] + self._env.scene.env_origins
+
+    @property
+    def object_quat_w(self) -> torch.Tensor:
+        return self.motion.object_quat_w[self.time_steps]
+
+    @property
+    def object_lin_vel_w(self) -> torch.Tensor:
+        return self.motion.object_lin_vel_w[self.time_steps]
+
+    @property
+    def object_ang_vel_w(self) -> torch.Tensor:
+        return self.motion.object_ang_vel_w[self.time_steps]
 
     @property
     def anchor_pos_w(self) -> torch.Tensor:
@@ -322,6 +381,23 @@ class MotionCommand(CommandTerm):
             env_ids=env_ids,
         )
 
+        if self.has_object:
+            # Place the object at its reference pose/velocity on reset only; physics (contacts
+            # with the robot) drives it from there on, so it is actually simulated rather than
+            # kinematically replayed every step.
+            self.object.write_root_state_to_sim(
+                torch.cat(
+                    [
+                        self.object_pos_w[env_ids],
+                        self.object_quat_w[env_ids],
+                        self.object_lin_vel_w[env_ids],
+                        self.object_ang_vel_w[env_ids],
+                    ],
+                    dim=-1,
+                ),
+                env_ids=env_ids,
+            )
+
     def _update_command(self):
         self.time_steps += 1
         env_ids = torch.where(self.time_steps >= self.motion.time_step_total)[0]
@@ -407,6 +483,9 @@ class MotionCommandCfg(CommandTermCfg):
     motion_file: str = MISSING
     anchor_body_name: str = MISSING
     body_names: list[str] = MISSING
+    object_asset_name: str | None = None
+    """Scene entity name of the tracked rigid object, e.g. "object". None disables object tracking,
+    even if the motion file has object data."""
     default_motion_body_names: list[str] | None = None
     default_motion_joint_names: list[str] | None = None
     tail_len: int = 0

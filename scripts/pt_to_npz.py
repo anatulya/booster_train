@@ -9,9 +9,16 @@ fixed fps, with the layout built by ``_make_obs_layout(num_bodies, num_dof)``::
     root_ang_vel  [10:13]                     world frame, rad/s
     dof_pos       [13 : 13+ND]                rad
     dof_vel       [13+ND : 13+2*ND]           rad/s
-    obj_*         [13+2*ND : 26+2*ND]         ignored
+    obj_pos       [13+2*ND : 16+2*ND]         world frame, m
+    obj_rot       [16+2*ND : 20+2*ND]         quaternion, xyzw
+    obj_lin_vel   [20+2*ND : 23+2*ND]         world frame, m/s
+    obj_ang_vel   [23+2*ND : 26+2*ND]         world frame, rad/s
     body_*        [26+2*ND : 26+2*ND+13*NB]   ignored, regenerated from the Booster model
     contact       trailing NB                 ignored
+
+The object block is carried straight through to the output npz (as ``object_pos_w``,
+``object_quat_w``, ``object_lin_vel_w``, ``object_ang_vel_w``): unlike the robot body block,
+there is no differing source/target body set to reconcile, so no re-simulation is needed.
 
 Reference points match Isaac Lab throughout: positions and orientations are link frame,
 linear velocities are center of mass, and angular velocity is frame-independent. That is
@@ -72,7 +79,7 @@ simulation_app = app_launcher.app
 import torch
 
 import isaaclab.sim as sim_utils
-from isaaclab.assets import ArticulationCfg, AssetBaseCfg
+from isaaclab.assets import ArticulationCfg, AssetBaseCfg, RigidObject, RigidObjectCfg
 from isaaclab.scene import InteractiveScene, InteractiveSceneCfg
 from isaaclab.sim import SimulationContext
 from isaaclab.utils import configclass
@@ -82,6 +89,7 @@ from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR
 # Pre-defined configs
 ##
 from booster_train.assets.robots.booster import BOOSTER_K1_CFG as ROBOT_CFG
+from booster_train.assets.objects.boxes import SMALLBOX_0539923_CFG as OBJECT_CFG
 
 # The source DOF order, one row per actuated joint, in the order the columns appear in the
 # .pt file. Each row lists the aliases this joint is known by, because the InterMimic
@@ -152,6 +160,9 @@ class ReplayMotionsSceneCfg(InteractiveSceneCfg):
     # articulation
     robot: ArticulationCfg = ROBOT_CFG.replace(prim_path="{ENV_REGEX_NS}/Robot")
 
+    # tracked object
+    object: RigidObjectCfg = OBJECT_CFG.replace(prim_path="{ENV_REGEX_NS}/Object")
+
 
 class InterMimicMotionLoader:
     def __init__(
@@ -209,6 +220,12 @@ class InterMimicMotionLoader:
         self.motion_dof_poss = motion[:, 13 : 13 + nd]
         self.motion_dof_vels = motion[:, 13 + nd : 13 + 2 * nd]
 
+        obj_start = 13 + 2 * nd
+        self.motion_object_poss = motion[:, obj_start : obj_start + 3]
+        self.motion_object_rots = motion[:, obj_start + 3 : obj_start + 7][:, [3, 0, 1, 2]]  # convert to wxyz
+        self.motion_object_lin_vels = motion[:, obj_start + 7 : obj_start + 10]
+        self.motion_object_ang_vels = motion[:, obj_start + 10 : obj_start + 13]
+
         # Kept only for the post-bake diagnostics; the final reference regenerates these.
         body_start = 26 + 2 * nd
         nb = self.num_bodies
@@ -218,6 +235,12 @@ class InterMimicMotionLoader:
         quat_norm = self.motion_base_rots.norm(dim=-1)
         if not torch.allclose(quat_norm, torch.ones_like(quat_norm), atol=1e-3):
             raise ValueError(f"Root quaternions are not unit norm (min {quat_norm.min()}, max {quat_norm.max()}).")
+
+        obj_quat_norm = self.motion_object_rots.norm(dim=-1)
+        if not torch.allclose(obj_quat_norm, torch.ones_like(obj_quat_norm), atol=1e-3):
+            raise ValueError(
+                f"Object quaternions are not unit norm (min {obj_quat_norm.min()}, max {obj_quat_norm.max()})."
+            )
 
         self.output_frames = motion.shape[0]
         self.duration = (self.output_frames - 1) * self.output_dt
@@ -235,6 +258,10 @@ class InterMimicMotionLoader:
             self.motion_base_ang_vels[self.current_idx : self.current_idx + 1],
             self.motion_dof_poss[self.current_idx : self.current_idx + 1],
             self.motion_dof_vels[self.current_idx : self.current_idx + 1],
+            self.motion_object_poss[self.current_idx : self.current_idx + 1],
+            self.motion_object_rots[self.current_idx : self.current_idx + 1],
+            self.motion_object_lin_vels[self.current_idx : self.current_idx + 1],
+            self.motion_object_ang_vels[self.current_idx : self.current_idx + 1],
         )
         self.current_idx += 1
         reset_flag = False
@@ -281,6 +308,7 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
 
     # Extract scene entities
     robot = scene["robot"]
+    obj: RigidObject = scene["object"]
     robot_joint_indexes = resolve_joint_indexes(list(robot.joint_names), K1_DOF_ALIASES)
     if len(robot.joint_names) != len(robot_joint_indexes):
         print(
@@ -304,6 +332,10 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
         "body_quat_w": [],
         "body_lin_vel_w": [],
         "body_ang_vel_w": [],
+        "object_pos_w": [],
+        "object_quat_w": [],
+        "object_lin_vel_w": [],
+        "object_ang_vel_w": [],
         "joint_names": np.array(robot.joint_names),
         "body_names": np.array(robot.body_names),
     }
@@ -320,6 +352,10 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
                 motion_base_ang_vel,
                 motion_dof_pos,
                 motion_dof_vel,
+                motion_object_pos,
+                motion_object_rot,
+                motion_object_lin_vel,
+                motion_object_ang_vel,
             ),
             reset_flag,
         ) = motion.get_next_state()
@@ -341,6 +377,16 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
         joint_pos[:, robot_joint_indexes] = motion_dof_pos
         joint_vel[:, robot_joint_indexes] = motion_dof_vel
         robot.write_joint_state_to_sim(joint_pos, joint_vel)
+
+        # set object state (kinematic replay, same convention as the robot root above)
+        object_states = obj.data.default_root_state.clone()
+        object_states[:, :3] = motion_object_pos
+        object_states[:, :2] += scene.env_origins[:, :2]
+        object_states[:, 3:7] = motion_object_rot
+        object_states[:, 7:10] = motion_object_lin_vel
+        object_states[:, 10:] = motion_object_ang_vel
+        obj.write_root_state_to_sim(object_states)
+
         sim.render()  # We don't want physic (sim.step())
         scene.update(sim.get_physics_dt())
 
@@ -354,6 +400,10 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
             log["body_quat_w"].append(robot.data.body_quat_w[0, :].cpu().numpy().copy())
             log["body_lin_vel_w"].append(robot.data.body_lin_vel_w[0, :].cpu().numpy().copy())
             log["body_ang_vel_w"].append(robot.data.body_ang_vel_w[0, :].cpu().numpy().copy())
+            log["object_pos_w"].append(motion_object_pos[0, :].cpu().numpy().copy())
+            log["object_quat_w"].append(motion_object_rot[0, :].cpu().numpy().copy())
+            log["object_lin_vel_w"].append(motion_object_lin_vel[0, :].cpu().numpy().copy())
+            log["object_ang_vel_w"].append(motion_object_ang_vel[0, :].cpu().numpy().copy())
 
         if reset_flag and not file_saved:
             file_saved = True
@@ -364,6 +414,10 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
                 "body_quat_w",
                 "body_lin_vel_w",
                 "body_ang_vel_w",
+                "object_pos_w",
+                "object_quat_w",
+                "object_lin_vel_w",
+                "object_ang_vel_w",
             ):
                 log[k] = np.stack(log[k], axis=0)
 
@@ -387,17 +441,23 @@ def report_bake_quality(log: dict, motion: InterMimicMotionLoader, robot):
     min_z = log["body_pos_w"][..., 2].min()
     min_z_body = robot.body_names[int(np.argmin(log["body_pos_w"][..., 2].min(axis=0)))]
 
+    obj_min_z = log["object_pos_w"][..., 2].min()
+    obj_max_z = log["object_pos_w"][..., 2].max()
+
     print("[CHECK]: ---- bake quality ----")
     print(f"[CHECK]: frames baked                    : {log['body_pos_w'].shape[0]}")
     print(f"[CHECK]: root pos round-trip (max abs)   : {pos_err:.6f} m   (expect ~0)")
     print(f"[CHECK]: root lin vel round-trip (max abs): {vel_err:.6f} m/s (expect ~0)")
     print(f"[CHECK]: lowest body over the motion     : {min_z:.4f} m on '{min_z_body}'")
+    print(f"[CHECK]: object height range              : [{obj_min_z:.4f}, {obj_max_z:.4f}] m")
     if pos_err > 1e-3:
         print("[CHECK]: WARNING root position did not round-trip; the source root frame likely differs from Trunk.")
     if vel_err > 1e-2:
         print("[CHECK]: WARNING root velocity did not round-trip; check the source velocity reference point.")
     if min_z < -0.02:
         print("[CHECK]: WARNING bodies penetrate the ground plane; the motion may need a z offset.")
+    if obj_min_z < -0.02:
+        print("[CHECK]: WARNING object penetrates the ground plane; check the object frame convention.")
 
 
 def main():

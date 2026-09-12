@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import MISSING
 
 import isaaclab.sim as sim_utils
-from isaaclab.assets import ArticulationCfg, AssetBaseCfg
+from isaaclab.assets import ArticulationCfg, AssetBaseCfg, RigidObjectCfg
 from isaaclab.envs import ManagerBasedRLEnvCfg
 from isaaclab.managers import EventTermCfg as EventTerm
 from isaaclab.managers import ObservationGroupCfg as ObsGroup
@@ -59,6 +59,8 @@ class MySceneCfg(InteractiveSceneCfg):
     )
     # robots
     robot: ArticulationCfg = MISSING
+    # tracked object
+    object: RigidObjectCfg = MISSING
     # lights
     light = AssetBaseCfg(
         prim_path="/World/light",
@@ -84,6 +86,7 @@ class CommandsCfg:
 
     motion = mdp.MotionCommandCfg(
         asset_name="robot",
+        object_asset_name="object",
         resampling_time_range=(1.0e9, 1.0e9),
         debug_vis=True,
         pose_range={
@@ -122,6 +125,18 @@ class ObservationsCfg:
         motion_anchor_ori_b = ObsTerm(
             func=mdp.motion_anchor_ori_b, params={"command_name": "motion"}, noise=Unoise(n_min=-0.05, n_max=0.05)
         )
+        object_pos_residual_b = ObsTerm(
+            func=mdp.object_pos_residual_b, params={"command_name": "motion"}, noise=Unoise(n_min=-0.1, n_max=0.1)
+        )
+        object_ori_residual_b = ObsTerm(
+            func=mdp.object_ori_residual_b, params={"command_name": "motion"}, noise=Unoise(n_min=-0.05, n_max=0.05)
+        )
+        object_pos_b = ObsTerm(
+            func=mdp.object_pos_b, params={"command_name": "motion"}, noise=Unoise(n_min=-0.25, n_max=0.25)
+        )
+        object_ori_b = ObsTerm(
+            func=mdp.object_ori_b, params={"command_name": "motion"}, noise=Unoise(n_min=-0.05, n_max=0.05)
+        )
         base_lin_vel = ObsTerm(func=mdp.base_lin_vel, noise=Unoise(n_min=-0.5, n_max=0.5))
         base_ang_vel = ObsTerm(func=mdp.base_ang_vel, noise=Unoise(n_min=-0.2, n_max=0.2))
         joint_pos = ObsTerm(func=mdp.joint_pos_rel, noise=Unoise(n_min=-0.01, n_max=0.01))
@@ -137,10 +152,16 @@ class ObservationsCfg:
         command = ObsTerm(func=mdp.generated_commands, params={"command_name": "motion"})
         motion_anchor_pos_b = ObsTerm(func=mdp.motion_anchor_pos_b, params={"command_name": "motion"})
         motion_anchor_ori_b = ObsTerm(func=mdp.motion_anchor_ori_b, params={"command_name": "motion"})
+        object_pos_residual_b = ObsTerm(func=mdp.object_pos_residual_b, params={"command_name": "motion"})
+        object_ori_residual_b = ObsTerm(func=mdp.object_ori_residual_b, params={"command_name": "motion"})
+        object_pos_b = ObsTerm(func=mdp.object_pos_b, params={"command_name": "motion"})
+        object_ori_b = ObsTerm(func=mdp.object_ori_b, params={"command_name": "motion"})
         body_pos = ObsTerm(func=mdp.robot_body_pos_b, params={"command_name": "motion"})
         body_ori = ObsTerm(func=mdp.robot_body_ori_b, params={"command_name": "motion"})
         base_lin_vel = ObsTerm(func=mdp.base_lin_vel)
         base_ang_vel = ObsTerm(func=mdp.base_ang_vel)
+        object_lin_vel_b = ObsTerm(func=mdp.object_lin_vel_b, params={"command_name": "motion"})
+        object_ang_vel_b = ObsTerm(func=mdp.object_ang_vel_b, params={"command_name": "motion"})
         joint_pos = ObsTerm(func=mdp.joint_pos_rel)
         joint_vel = ObsTerm(func=mdp.joint_vel_rel)
         actions = ObsTerm(func=mdp.last_action)

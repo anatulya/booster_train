@@ -19,8 +19,8 @@ literal duplicate of the last pose, which is what the reference motions contain.
 import argparse
 import numpy as np
 
-POSE_KEYS = ("joint_pos", "body_pos_w", "body_quat_w")
-VELOCITY_KEYS = ("joint_vel", "body_lin_vel_w", "body_ang_vel_w")
+POSE_KEYS = ("joint_pos", "body_pos_w", "body_quat_w", "object_pos_w", "object_quat_w")
+VELOCITY_KEYS = ("joint_vel", "body_lin_vel_w", "body_ang_vel_w", "object_lin_vel_w", "object_ang_vel_w")
 META_KEYS = ("fps", "joint_names", "body_names")
 
 
@@ -37,11 +37,15 @@ def main():
 
     out = {}
     for key in POSE_KEYS:
+        if key not in src:
+            continue
         data = np.asarray(src[key])
         # freeze the final pose across the hold
         hold = np.repeat(data[-1:], args.frames, axis=0)
         out[key] = np.concatenate([data, hold], axis=0)
     for key in VELOCITY_KEYS:
+        if key not in src:
+            continue
         data = np.asarray(src[key])
         hold = np.zeros((args.frames,) + data.shape[1:], dtype=data.dtype)
         out[key] = np.concatenate([data, hold], axis=0)
@@ -54,7 +58,7 @@ def main():
     # the last frame of the source still carries whatever velocity the clip ended on; the
     # hold starts at exactly zero, so report the step for visibility (the dance reference has
     # the same discontinuity: 3.96 rad/s -> 0.0 in one frame).
-    seam_vel = max(np.abs(np.asarray(src[k])[-1]).max() for k in VELOCITY_KEYS)
+    seam_vel = max(np.abs(np.asarray(src[k])[-1]).max() for k in VELOCITY_KEYS if k in src)
 
     print(f"[INFO]: {args.input}: {n_src} frames ({n_src / fps:.2f} s)")
     print(f"[INFO]: appended {args.frames} held frames ({args.frames / fps:.2f} s), velocities zeroed")
