@@ -3,8 +3,9 @@ from isaaclab.assets import RigidObjectCfg
 
 from booster_assets import BOOSTER_ASSETS_DIR
 
-# Retargeted from the InterMimic sub4_smallbox_047 capture; mass/inertia/friction come
-# straight from the URDF (scanned box, ~0.1 kg).
+# Retargeted from the InterMimic sub4_smallbox_047 capture. Mass and inertia come from the URDF;
+# surface properties do not -- Isaac Lab's URDF converter ignores the PyBullet <contact> block, so
+# friction/restitution are set by the object_physics_material event instead.
 SMALLBOX_0539923_CFG = RigidObjectCfg(
     spawn=sim_utils.UrdfFileCfg(
         fix_base=False,

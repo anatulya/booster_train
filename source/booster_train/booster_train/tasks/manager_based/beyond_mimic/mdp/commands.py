@@ -400,16 +400,31 @@ class MotionCommand(CommandTerm):
             # Place the object at its reference pose/velocity on reset only; physics (contacts
             # with the robot) drives it from there on, so it is actually simulated rather than
             # kinematically replayed every step.
+            object_pos = self.object_pos_w[env_ids]
+            object_ori = self.object_quat_w[env_ids]
+            object_lin_vel = self.object_lin_vel_w[env_ids]
+            object_ang_vel = self.object_ang_vel_w[env_ids]
+
+            # Jitter here rather than in an event term: an event would race with this write,
+            # since both run at reset and the order between the two managers is not guaranteed.
+            range_list = [self.cfg.object_pose_range.get(key, (0.0, 0.0)) for key in ["x", "y", "z", "roll", "pitch", "yaw"]]
+            ranges = torch.tensor(range_list, device=self.device)
+            rand_samples = sample_uniform(ranges[:, 0], ranges[:, 1], (len(env_ids), 6), device=self.device)
+            object_pos = object_pos + rand_samples[:, 0:3]
+            object_ori = quat_mul(
+                quat_from_euler_xyz(rand_samples[:, 3], rand_samples[:, 4], rand_samples[:, 5]), object_ori
+            )
+
+            range_list = [
+                self.cfg.object_velocity_range.get(key, (0.0, 0.0)) for key in ["x", "y", "z", "roll", "pitch", "yaw"]
+            ]
+            ranges = torch.tensor(range_list, device=self.device)
+            rand_samples = sample_uniform(ranges[:, 0], ranges[:, 1], (len(env_ids), 6), device=self.device)
+            object_lin_vel = object_lin_vel + rand_samples[:, :3]
+            object_ang_vel = object_ang_vel + rand_samples[:, 3:]
+
             self.object.write_root_state_to_sim(
-                torch.cat(
-                    [
-                        self.object_pos_w[env_ids],
-                        self.object_quat_w[env_ids],
-                        self.object_lin_vel_w[env_ids],
-                        self.object_ang_vel_w[env_ids],
-                    ],
-                    dim=-1,
-                ),
+                torch.cat([object_pos, object_ori, object_lin_vel, object_ang_vel], dim=-1),
                 env_ids=env_ids,
             )
 
@@ -519,6 +534,11 @@ class MotionCommandCfg(CommandTermCfg):
 
     pose_range: dict[str, tuple[float, float]] = {}
     velocity_range: dict[str, tuple[float, float]] = {}
+
+    object_pose_range: dict[str, tuple[float, float]] = {}
+    """Reset jitter applied to the tracked object's reference pose, same key format as
+    :attr:`pose_range`. Empty means the object resets exactly onto the reference."""
+    object_velocity_range: dict[str, tuple[float, float]] = {}
 
     joint_position_range: tuple[float, float] = (-0.52, 0.52)
 
