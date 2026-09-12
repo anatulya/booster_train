@@ -251,6 +251,36 @@ class RewardsCfg:
         weight=1.0,
         params={"command_name": "motion", "std": 3.14},
     )
+    motion_global_object_pos = RewTerm(
+        func=mdp.motion_global_object_position_error_exp,
+        weight=0.5,
+        params={"command_name": "motion", "std": 0.3},
+    )
+    motion_global_object_ori = RewTerm(
+        func=mdp.motion_global_object_orientation_error_exp,
+        weight=0.5,
+        params={"command_name": "motion", "std": 0.4},
+    )
+    motion_object_pos = RewTerm(
+        func=mdp.motion_relative_object_position_error_exp,
+        weight=20.0,
+        params={"command_name": "motion", "std": 0.2},
+    )
+    motion_object_ori = RewTerm(
+        func=mdp.motion_relative_object_orientation_error_exp,
+        weight=15.0,
+        params={"command_name": "motion", "std": 0.2},
+    )
+    motion_object_lin_vel = RewTerm(
+        func=mdp.motion_global_object_linear_velocity_error_exp,
+        weight=1.0,
+        params={"command_name": "motion", "std": 1.0},
+    )
+    motion_object_ang_vel = RewTerm(
+        func=mdp.motion_global_object_angular_velocity_error_exp,
+        weight=1.0,
+        params={"command_name": "motion", "std": 3.14},
+    )
     action_rate_l2 = RewTerm(func=mdp.action_rate_l2, weight=-2.0)
     joint_limit = RewTerm(
         func=mdp.joint_pos_limits,
@@ -338,6 +368,10 @@ class TerminationsCfg:
                 "right_foot_link",
             ],
         },
+    )
+    object_pos = DoneTerm(
+        func=mdp.bad_motion_object_pos,
+        params={"command_name": "motion", "threshold": 0.5},
     )
 
 

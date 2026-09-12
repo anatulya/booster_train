@@ -142,6 +142,10 @@ class MotionCommand(CommandTerm):
         self.body_pos_relative_w = torch.zeros(self.num_envs, len(cfg.body_names), 3, device=self.device)
         self.body_quat_relative_w = torch.zeros(self.num_envs, len(cfg.body_names), 4, device=self.device)
         self.body_quat_relative_w[:, :, 0] = 1.0
+        if self.has_object:
+            self.object_pos_relative_w = torch.zeros(self.num_envs, 3, device=self.device)
+            self.object_quat_relative_w = torch.zeros(self.num_envs, 4, device=self.device)
+            self.object_quat_relative_w[:, 0] = 1.0
 
         self.bin_count = int(self.motion.max_reset_frame // (1 / (env.cfg.decimation * env.cfg.sim.dt))) + 1
         self.bin_failed_count = torch.zeros(self.bin_count, dtype=torch.float, device=self.device)
@@ -157,6 +161,9 @@ class MotionCommand(CommandTerm):
         self.metrics["error_anchor_ang_vel"] = torch.zeros(self.num_envs, device=self.device)
         self.metrics["error_body_pos"] = torch.zeros(self.num_envs, device=self.device)
         self.metrics["error_body_rot"] = torch.zeros(self.num_envs, device=self.device)
+        if self.has_object:
+            self.metrics["error_object_pos"] = torch.zeros(self.num_envs, device=self.device)
+            self.metrics["error_object_rot"] = torch.zeros(self.num_envs, device=self.device)
         self.metrics["error_joint_pos"] = torch.zeros(self.num_envs, device=self.device)
         self.metrics["error_joint_vel"] = torch.zeros(self.num_envs, device=self.device)
         self.metrics["sampling_entropy"] = torch.zeros(self.num_envs, device=self.device)
@@ -290,6 +297,14 @@ class MotionCommand(CommandTerm):
             dim=-1
         )
 
+        if self.has_object:
+            self.metrics["error_object_pos"] = torch.norm(
+                self.object_pos_relative_w - self.object.data.root_pos_w, dim=-1
+            )
+            self.metrics["error_object_rot"] = quat_error_magnitude(
+                self.object_quat_relative_w, self.object.data.root_quat_w
+            )
+
         self.metrics["error_body_lin_vel"] = torch.norm(self.body_lin_vel_w - self.robot_body_lin_vel_w, dim=-1).mean(
             dim=-1
         )
@@ -414,6 +429,18 @@ class MotionCommand(CommandTerm):
 
         self.body_quat_relative_w = quat_mul(delta_ori_w, self.body_quat_w)
         self.body_pos_relative_w = delta_pos_w + quat_apply(delta_ori_w, self.body_pos_w - anchor_pos_w_repeat)
+
+        if self.has_object:
+            # robot_anchor_pos_w is a view into robot.data.body_pos_w, so clone before the
+            # in-place z write below -- otherwise this corrupts the anchor body's position.
+            object_delta_pos_w = self.robot_anchor_pos_w.clone()
+            object_delta_pos_w[:, 2] = self.anchor_pos_w[:, 2]
+            object_delta_ori_w = yaw_quat(quat_mul(self.robot_anchor_quat_w, quat_inv(self.anchor_quat_w)))
+
+            self.object_quat_relative_w = quat_mul(object_delta_ori_w, self.object_quat_w)
+            self.object_pos_relative_w = object_delta_pos_w + quat_apply(
+                object_delta_ori_w, self.object_pos_w - self.anchor_pos_w
+            )
 
         self.bin_failed_count = (
             self.cfg.adaptive_alpha * self._current_bin_failed + (1 - self.cfg.adaptive_alpha) * self.bin_failed_count

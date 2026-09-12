@@ -96,6 +96,54 @@ def motion_global_body_angular_velocity_error_exp(
     return torch.exp(-error / std**2)
 
 
+def motion_global_object_position_error_exp(
+        env: ManagerBasedRLEnv, command_name: str, std: float | str) -> torch.Tensor:
+    command: MotionCommand = env.command_manager.get_term(command_name)
+    error = torch.sum(torch.square(command.object_pos_w - command.object.data.root_pos_w), dim=-1)
+    std = _get_adaptive_sigma(env, std, error.mean())
+    return torch.exp(-error / std**2)
+
+
+def motion_global_object_orientation_error_exp(
+        env: ManagerBasedRLEnv, command_name: str, std: float | str) -> torch.Tensor:
+    command: MotionCommand = env.command_manager.get_term(command_name)
+    error = quat_error_magnitude(command.object_quat_w, command.object.data.root_quat_w) ** 2
+    std = _get_adaptive_sigma(env, std, error.mean())
+    return torch.exp(-error / std**2)
+
+
+def motion_relative_object_position_error_exp(
+        env: ManagerBasedRLEnv, command_name: str, std: float | str) -> torch.Tensor:
+    command: MotionCommand = env.command_manager.get_term(command_name)
+    error = torch.sum(torch.square(command.object_pos_relative_w - command.object.data.root_pos_w), dim=-1)
+    std = _get_adaptive_sigma(env, std, error.mean())
+    return torch.exp(-error / std**2)
+
+
+def motion_relative_object_orientation_error_exp(
+        env: ManagerBasedRLEnv, command_name: str, std: float | str) -> torch.Tensor:
+    command: MotionCommand = env.command_manager.get_term(command_name)
+    error = quat_error_magnitude(command.object_quat_relative_w, command.object.data.root_quat_w) ** 2
+    std = _get_adaptive_sigma(env, std, error.mean())
+    return torch.exp(-error / std**2)
+
+
+def motion_global_object_linear_velocity_error_exp(
+        env: ManagerBasedRLEnv, command_name: str, std: float | str) -> torch.Tensor:
+    command: MotionCommand = env.command_manager.get_term(command_name)
+    error = torch.sum(torch.square(command.object_lin_vel_w - command.object.data.root_lin_vel_w), dim=-1)
+    std = _get_adaptive_sigma(env, std, error.mean())
+    return torch.exp(-error / std**2)
+
+
+def motion_global_object_angular_velocity_error_exp(
+        env: ManagerBasedRLEnv, command_name: str, std: float | str) -> torch.Tensor:
+    command: MotionCommand = env.command_manager.get_term(command_name)
+    error = torch.sum(torch.square(command.object_ang_vel_w - command.object.data.root_ang_vel_w), dim=-1)
+    std = _get_adaptive_sigma(env, std, error.mean())
+    return torch.exp(-error / std**2)
+
+
 def feet_stance_time(
         env: ManagerBasedRLEnv, asset_name: str, feet_names: list[str], vel_threshold: float, desired_time: float
 ) -> torch.Tensor:

@@ -38,6 +38,11 @@ def bad_anchor_ori(
     return (motion_projected_gravity_b[:, 2] - robot_projected_gravity_b[:, 2]).abs() > threshold
 
 
+def bad_motion_object_pos(env: ManagerBasedRLEnv, command_name: str, threshold: float) -> torch.Tensor:
+    command: MotionCommand = env.command_manager.get_term(command_name)
+    return torch.norm(command.object_pos_relative_w - command.object.data.root_pos_w, dim=-1) > threshold
+
+
 def bad_motion_body_pos(
     env: ManagerBasedRLEnv, command_name: str, threshold: float, body_names: list[str] | None = None
 ) -> torch.Tensor:
