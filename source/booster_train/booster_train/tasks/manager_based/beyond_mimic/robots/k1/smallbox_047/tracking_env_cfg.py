@@ -99,11 +99,6 @@ class CommandsCfg:
         },
         velocity_range=VELOCITY_RANGE,
         joint_position_range=(-0.1, 0.1),
-        object_pose_range={
-            "x": (-0.02, 0.02),
-            "y": (-0.02, 0.02),
-            "yaw": (-0.1, 0.1),
-        },
     )
 
 
@@ -309,7 +304,7 @@ class RewardsCfg:
     )
     motion_object_ori = RewTerm(
         func=mdp.motion_relative_object_orientation_error_exp,
-        weight=15.0,
+        weight=5.0,
         params={"command_name": "motion", "std": 0.2},
     )
     motion_object_lin_vel = RewTerm(
@@ -328,19 +323,21 @@ class RewardsCfg:
         weight=-10.0,
         params={"asset_cfg": SceneEntityCfg("robot", joint_names=[".*"])},
     )
-    undesired_contacts = RewTerm(
-        func=mdp.undesired_contacts,
-        weight=-10.0,
-        params={
-            "sensor_cfg": SceneEntityCfg(
-                "contact_forces",
-                body_names=[
-                    r"^(?!left_foot_link$)(?!right_foot_link$).+$"
-                ],
-            ),
-            "threshold": 1.0,
-        },
-    )
+    # Disabled: penalizes any non-foot contact, which includes the hands gripping the box --
+    # this was fighting the grasp/carry behavior we actually want (see conversation history).
+    # undesired_contacts = RewTerm(
+    #     func=mdp.undesired_contacts,
+    #     weight=-10.0,
+    #     params={
+    #         "sensor_cfg": SceneEntityCfg(
+    #             "contact_forces",
+    #             body_names=[
+    #                 r"^(?!left_foot_link$)(?!right_foot_link$).+$"
+    #             ],
+    #         ),
+    #         "threshold": 1.0,
+    #     },
+    # )
     motion_foot_ori = RewTerm(
         func=mdp.motion_relative_body_orientation_error_exp,
         weight=15.0,
