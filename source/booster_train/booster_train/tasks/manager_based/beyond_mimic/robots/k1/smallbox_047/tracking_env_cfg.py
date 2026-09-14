@@ -36,6 +36,16 @@ VELOCITY_RANGE = {
     "yaw": (-0.9, 0.9),
 }
 
+# Hand-object contact, shared by the reward and termination so both agree on what counts as contact.
+# Order must match the npz "contact" channels (scripts/pt_to_npz.py CONTACT_CHANNELS).
+HAND_CONTACT_SENSOR_NAMES = ["left_hand_object_contact", "right_hand_object_contact"]
+# The box's rigid body is a child link; filtering against ".../Object" itself registers no force.
+OBJECT_CONTACT_FILTER = "{ENV_REGEX_NS}/Object/smallbox_0539923_link"
+# The box is 0.011-0.30 kg under DR, so a correct grasp can need well under 1 N per hand.
+HAND_CONTACT_FORCE_THRESHOLD = 0.1
+# Bodies whose position relative to the object is observed, rewarded and terminated on (coarse interaction graph).
+HAND_BODY_NAMES = ["left_hand_link", "right_hand_link"]
+
 
 @configclass
 class MySceneCfg(InteractiveSceneCfg):
@@ -72,6 +82,15 @@ class MySceneCfg(InteractiveSceneCfg):
     )
     contact_forces = ContactSensorCfg(
         prim_path="{ENV_REGEX_NS}/Robot/.*", history_length=3, track_air_time=True, force_threshold=10.0, debug_vis=True
+    )
+    # Filtered contact is one sensor body to many targets, so each hand gets its own sensor.
+    # history_length covers every physics substep of a control step (decimation 4, or 8 in the low-freq
+    # variant): brief touches often land on a substep other than the last one.
+    left_hand_object_contact = ContactSensorCfg(
+        prim_path="{ENV_REGEX_NS}/Robot/left_hand_link", filter_prim_paths_expr=[OBJECT_CONTACT_FILTER], history_length=8
+    )
+    right_hand_object_contact = ContactSensorCfg(
+        prim_path="{ENV_REGEX_NS}/Robot/right_hand_link", filter_prim_paths_expr=[OBJECT_CONTACT_FILTER], history_length=8
     )
 
 
@@ -119,6 +138,20 @@ class ObservationsCfg:
 
         # observation terms (order preserved)
         command = ObsTerm(func=mdp.generated_commands, params={"command_name": "motion"})
+        # current contact, mirroring the reference contact at the end of `command`
+        hand_contact = ObsTerm(
+            func=mdp.hand_object_contact,
+            params={"contact_sensor_names": HAND_CONTACT_SENSOR_NAMES, "force_threshold": HAND_CONTACT_FORCE_THRESHOLD},
+        )
+        # object-to-hand vectors, robot vs reference, both in the robot anchor frame
+        hand_object_pos_b = ObsTerm(
+            func=mdp.body_object_relative_pos_b,
+            params={"command_name": "motion", "body_names": HAND_BODY_NAMES},
+            noise=Unoise(n_min=-0.1, n_max=0.1),
+        )
+        motion_hand_object_pos_b = ObsTerm(
+            func=mdp.motion_body_object_relative_pos_b, params={"command_name": "motion", "body_names": HAND_BODY_NAMES}
+        )
         motion_anchor_pos_b = ObsTerm(
             func=mdp.motion_anchor_pos_b, params={"command_name": "motion"}, noise=Unoise(n_min=-0.25, n_max=0.25)
         )
@@ -150,6 +183,16 @@ class ObservationsCfg:
     @configclass
     class PrivilegedCfg(ObsGroup):
         command = ObsTerm(func=mdp.generated_commands, params={"command_name": "motion"})
+        hand_contact = ObsTerm(
+            func=mdp.hand_object_contact,
+            params={"contact_sensor_names": HAND_CONTACT_SENSOR_NAMES, "force_threshold": HAND_CONTACT_FORCE_THRESHOLD},
+        )
+        hand_object_pos_b = ObsTerm(
+            func=mdp.body_object_relative_pos_b, params={"command_name": "motion", "body_names": HAND_BODY_NAMES}
+        )
+        motion_hand_object_pos_b = ObsTerm(
+            func=mdp.motion_body_object_relative_pos_b, params={"command_name": "motion", "body_names": HAND_BODY_NAMES}
+        )
         motion_anchor_pos_b = ObsTerm(func=mdp.motion_anchor_pos_b, params={"command_name": "motion"})
         motion_anchor_ori_b = ObsTerm(func=mdp.motion_anchor_ori_b, params={"command_name": "motion"})
         object_pos_residual_b = ObsTerm(func=mdp.object_pos_residual_b, params={"command_name": "motion"})
@@ -209,6 +252,19 @@ class EventCfg:
     )
 
     # startup -- object
+    # Fixed (not randomized) box collider offsets. Left unauthored, PhysX sizes them from the mesh
+    # (~2.5 mm contact / 0 rest for this box); collision_props on the spawn cfg cannot set them because
+    # the URDF importer makes the collision mesh instanceable, so they are written through PhysX here.
+    object_collider_offsets = EventTerm(
+        func=mdp.randomize_rigid_body_collider_offsets,
+        mode="startup",
+        params={
+            "asset_cfg": SceneEntityCfg("object"),
+            "contact_offset_distribution_params": (0.02, 0.02),
+            "rest_offset_distribution_params": (0.001, 0.001),
+        },
+    )
+
     # The box URDF's PyBullet <contact> block is ignored by Isaac Lab's URDF converter, so this
     # term is what actually gives the box its surface properties.
     object_physics_material = EventTerm(
@@ -362,6 +418,25 @@ class RewardsCfg:
         params={"command_name": "motion", "std": 0.2, "body_names": ["left_hand_link", "right_hand_link"]},
     )
 
+    # ULTRA (arXiv:2603.03279) r_ct = exp(-k_ct * mean|c - c_ref|), k_ct = 5.0  ->  std = 1/sqrt(5) = 0.45.
+    motion_hand_contact = RewTerm(
+        func=mdp.motion_hand_contact_error_exp,
+        weight=10.0,
+        params={
+            "command_name": "motion",
+            "std": 0.45,
+            "contact_sensor_names": HAND_CONTACT_SENSOR_NAMES,
+            "force_threshold": HAND_CONTACT_FORCE_THRESHOLD,
+        },
+    )
+
+    # Coarse ULTRA-style interaction-graph reward: object-to-hand vectors, robot vs reference.
+    motion_hand_object_pos = RewTerm(
+        func=mdp.motion_body_object_relative_position_error_exp,
+        weight=30.0,
+        params={"command_name": "motion", "std": 0.15, "body_names": HAND_BODY_NAMES},
+    )
+
     motion_trunk_ori = RewTerm(
         func=mdp.motion_relative_body_orientation_error_exp,
         weight=30.0,
@@ -410,6 +485,19 @@ class TerminationsCfg:
     object_pos = DoneTerm(
         func=mdp.bad_motion_object_pos,
         params={"command_name": "motion", "threshold": 0.5},
+    )
+    hand_object_pos = DoneTerm(
+        func=mdp.bad_body_object_relative_position,
+        params={"command_name": "motion", "threshold": 0.5, "body_names": HAND_BODY_NAMES},
+    )
+    hand_contact_mismatch = DoneTerm(
+        func=mdp.BadHandContactMismatchStreak,
+        params={
+            "command_name": "motion",
+            "contact_sensor_names": HAND_CONTACT_SENSOR_NAMES,
+            "force_threshold": HAND_CONTACT_FORCE_THRESHOLD,
+            "threshold_steps": 20,
+        },
     )
 
 

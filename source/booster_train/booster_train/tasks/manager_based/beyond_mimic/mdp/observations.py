@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING
 from isaaclab.utils.math import matrix_from_quat, quat_apply_inverse, quat_box_minus, subtract_frame_transforms
 
 from booster_train.tasks.manager_based.beyond_mimic.mdp.commands import MotionCommand
+from booster_train.tasks.manager_based.beyond_mimic.mdp.rewards import _body_object_vectors, _hand_object_contact_state
 
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedEnv
@@ -149,3 +150,30 @@ def object_ang_vel_b(env: ManagerBasedEnv, command_name: str) -> torch.Tensor:
 
     vel = quat_apply_inverse(command.robot_anchor_quat_w, command.object.data.root_ang_vel_w)
     return vel.view(env.num_envs, -1)
+
+
+def _in_robot_anchor_frame(command: MotionCommand, vectors: torch.Tensor) -> torch.Tensor:
+    quat = command.robot_anchor_quat_w[:, None].expand(-1, vectors.shape[1], -1)
+    return quat_apply_inverse(quat, vectors).reshape(vectors.shape[0], -1)
+
+
+def body_object_relative_pos_b(env: ManagerBasedEnv, command_name: str, body_names: list[str]) -> torch.Tensor:
+    """Object-to-body vectors of the robot, in the robot anchor frame."""
+    command: MotionCommand = env.command_manager.get_term(command_name)
+    robot, _ = _body_object_vectors(command, body_names)
+    return _in_robot_anchor_frame(command, robot)
+
+
+def motion_body_object_relative_pos_b(env: ManagerBasedEnv, command_name: str, body_names: list[str]) -> torch.Tensor:
+    """Object-to-body vectors of the reference, in the robot anchor frame."""
+    command: MotionCommand = env.command_manager.get_term(command_name)
+    _, reference = _body_object_vectors(command, body_names)
+    return _in_robot_anchor_frame(command, reference)
+
+
+def hand_object_contact(env: ManagerBasedEnv, contact_sensor_names: list[str], force_threshold: float) -> torch.Tensor:
+    """The robot's current 0/1 hand-object contact, channel-for-channel with the command's reference contact.
+
+    Same detection as the contact reward and termination, so all three agree on what counts as contact.
+    """
+    return _hand_object_contact_state(env, contact_sensor_names, force_threshold)

@@ -19,9 +19,10 @@ literal duplicate of the last pose, which is what the reference motions contain.
 import argparse
 import numpy as np
 
-POSE_KEYS = ("joint_pos", "body_pos_w", "body_quat_w", "object_pos_w", "object_quat_w")
+POSE_KEYS = ("joint_pos", "body_pos_w", "body_quat_w", "object_pos_w", "object_quat_w", "contact")
 VELOCITY_KEYS = ("joint_vel", "body_lin_vel_w", "body_ang_vel_w", "object_lin_vel_w", "object_ang_vel_w")
 META_KEYS = ("fps", "joint_names", "body_names")
+OPTIONAL_META_KEYS = ("contact_names",)
 
 
 def main():
@@ -51,6 +52,9 @@ def main():
         out[key] = np.concatenate([data, hold], axis=0)
     for key in META_KEYS:
         out[key] = src[key]
+    for key in OPTIONAL_META_KEYS:
+        if key in src:
+            out[key] = src[key]
 
     n_out = out["joint_pos"].shape[0]
     np.savez(args.output, **out)

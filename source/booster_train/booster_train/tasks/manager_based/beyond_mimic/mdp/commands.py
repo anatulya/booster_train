@@ -75,6 +75,10 @@ class MotionLoader:
             self._object_lin_vel_w = torch.tensor(data["object_lin_vel_w"], dtype=torch.float32, device=device)
             self._object_ang_vel_w = torch.tensor(data["object_ang_vel_w"], dtype=torch.float32, device=device)
 
+        self.has_contact = "contact" in data
+        if self.has_contact:
+            self._contact = torch.tensor(data["contact"], dtype=torch.float32, device=device)
+
     @property
     def body_pos_w(self) -> torch.Tensor:
         return self._body_pos_w[:, self._body_indexes]
@@ -111,6 +115,10 @@ class MotionLoader:
     def object_ang_vel_w(self) -> torch.Tensor:
         return self._object_ang_vel_w
 
+    @property
+    def contact(self) -> torch.Tensor:
+        return self._contact
+
 
 class MotionCommand(CommandTerm):
     cfg: MotionCommandCfg
@@ -138,6 +146,7 @@ class MotionCommand(CommandTerm):
         self.has_object = self.motion.has_object and self.cfg.object_asset_name is not None
         if self.has_object:
             self.object: RigidObject = env.scene[self.cfg.object_asset_name]
+        self.has_contact = self.motion.has_contact
         self.time_steps = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
         self.body_pos_relative_w = torch.zeros(self.num_envs, len(cfg.body_names), 3, device=self.device)
         self.body_quat_relative_w = torch.zeros(self.num_envs, len(cfg.body_names), 4, device=self.device)
@@ -186,6 +195,8 @@ class MotionCommand(CommandTerm):
                 quat_apply_inverse(self.anchor_quat_w, self.object_lin_vel_w),
                 quat_apply_inverse(self.anchor_quat_w, self.object_ang_vel_w),
             ]
+        if self.has_contact:
+            terms += [self.contact]
         return torch.cat(terms, dim=1)
 
     @property
@@ -227,6 +238,10 @@ class MotionCommand(CommandTerm):
     @property
     def object_ang_vel_w(self) -> torch.Tensor:
         return self.motion.object_ang_vel_w[self.time_steps]
+
+    @property
+    def contact(self) -> torch.Tensor:
+        return self.motion.contact[self.time_steps]
 
     @property
     def anchor_pos_w(self) -> torch.Tensor:

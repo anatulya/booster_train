@@ -33,16 +33,23 @@ link geometry than the Booster K1 model the policy is trained against.
 
 .. code-block:: bash
 
-    # Usage
+    # Bake only
     python pt_to_npz.py --headless \
         --input_file ./booster_assets/motions/K1/sub4_smallbox_047_smallbox_intermimic_original.pt \
         --output_name ./booster_assets/motions/K1/sub4_smallbox_047.npz
+
+    # Bake + offline/headless MP4 render
+    python pt_to_npz.py --headless \
+        --input_file ./booster_assets/motions/K1/sub4_smallbox_047_smallbox_intermimic_original.pt \
+        --output_name ./booster_assets/motions/K1/sub4_smallbox_047.npz \
+        --video ./sub4_smallbox_047.mp4
 """
 
 """Launch Isaac Sim Simulator first."""
 
 import argparse
 import sys
+from pathlib import Path
 import numpy as np
 
 from isaaclab.app import AppLauncher
@@ -64,11 +71,35 @@ parser.add_argument(
 parser.add_argument("--output_name", type=str, required=True, help="The name of the motion npz file.")
 parser.add_argument("--output_fps", type=int, default=50, help="The fps of the output motion. Must equal --input_fps.")
 parser.add_argument("--num_dof", type=int, default=22, help="Number of actuated DOF in the source file (K1: 22).")
+parser.add_argument("--video", type=str, default=None, help="Optional output MP4 path for offline rendering.")
+parser.add_argument("--video_width", type=int, default=1280, help="Rendered video width.")
+parser.add_argument("--video_height", type=int, default=720, help="Rendered video height.")
+parser.add_argument(
+    "--camera_offset",
+    type=float,
+    nargs=3,
+    default=(2.0, 2.0, 0.8),
+    metavar=("X", "Y", "Z"),
+    help="Camera position offset in world axes relative to the robot root.",
+)
+parser.add_argument(
+    "--camera_lookat_offset",
+    type=float,
+    nargs=3,
+    default=(0.0, 0.0, 0.25),
+    metavar=("X", "Y", "Z"),
+    help="Camera look-at offset in world axes relative to the robot root.",
+)
 
 # append AppLauncher cli args
 AppLauncher.add_app_launcher_args(parser)
 # parse the arguments
 args_cli = parser.parse_args()
+
+# Camera sensors require rendering extensions even when running headless.
+# Turn them on automatically only when MP4 output was requested.
+if args_cli.video is not None:
+    args_cli.enable_cameras = True
 
 # launch omniverse app
 app_launcher = AppLauncher(args_cli)
@@ -81,6 +112,7 @@ import torch
 import isaaclab.sim as sim_utils
 from isaaclab.assets import ArticulationCfg, AssetBaseCfg, RigidObject, RigidObjectCfg
 from isaaclab.scene import InteractiveScene, InteractiveSceneCfg
+from isaaclab.sensors import Camera, CameraCfg
 from isaaclab.sim import SimulationContext
 from isaaclab.utils import configclass
 from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR
@@ -167,6 +199,10 @@ class ReplayMotionsSceneCfg(InteractiveSceneCfg):
 
     # tracked object
     object: RigidObjectCfg = OBJECT_CFG.replace(prim_path="{ENV_REGEX_NS}/Object")
+
+    # Filled in from main() only when --video is requested, so normal NPZ baking
+    # does not pay the camera/rendering cost.
+    camera: CameraCfg | None = None
 
 
 class InterMimicMotionLoader:
@@ -304,6 +340,52 @@ def resolve_joint_indexes(robot_joint_names: list[str], aliases: list[tuple[str,
     return indexes
 
 
+
+class Mp4Writer:
+    """Small streaming MP4 writer so we never keep the full video in RAM."""
+
+    def __init__(self, path: str, fps: int):
+        try:
+            import imageio.v2 as imageio
+        except ImportError as exc:
+            raise RuntimeError(
+                "MP4 output requires imageio and imageio-ffmpeg. Install them with:\n"
+                "  pip install imageio imageio-ffmpeg"
+            ) from exc
+
+        self.path = path
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        self._writer = imageio.get_writer(
+            path,
+            fps=fps,
+            codec="libx264",
+            quality=8,
+            macro_block_size=None,
+        )
+
+    def append(self, rgb: torch.Tensor):
+        """Append one HxWx3/4 torch RGB(A) frame."""
+        frame = rgb.detach().cpu().numpy()
+        if frame.shape[-1] == 4:
+            frame = frame[..., :3]
+
+        # Current Isaac Lab RGB camera output is uint8, but keep this robust to
+        # float renderers as well.
+        if frame.dtype != np.uint8:
+            if np.issubdtype(frame.dtype, np.floating) and frame.max() <= 1.0:
+                frame = frame * 255.0
+            frame = np.clip(frame, 0, 255).astype(np.uint8)
+
+        self._writer.append_data(frame)
+
+    def close(self):
+        if self._writer is not None:
+            print(f"[INFO]: Finalizing video: {self.path}...", flush=True)
+            self._writer.close()
+            self._writer = None
+        print(f"[INFO]: Video saved to {self.path}", flush=True)
+
+
 def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
     """Runs the simulation loop."""
     # Load motion
@@ -319,6 +401,13 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
     # Extract scene entities
     robot = scene["robot"]
     obj: RigidObject = scene["object"]
+    camera: Camera | None = scene["camera"] if args_cli.video is not None else None
+    video_writer = Mp4Writer(args_cli.video, args_cli.output_fps) if args_cli.video is not None else None
+    camera_offset = torch.tensor(args_cli.camera_offset, device=sim.device, dtype=torch.float32).unsqueeze(0)
+    camera_lookat_offset = torch.tensor(
+        args_cli.camera_lookat_offset, device=sim.device, dtype=torch.float32
+    ).unsqueeze(0)
+
     robot_joint_indexes = resolve_joint_indexes(list(robot.joint_names), K1_DOF_ALIASES)
     if len(robot.joint_names) != len(robot_joint_indexes):
         print(
@@ -400,11 +489,28 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
         object_states[:, 10:] = motion_object_ang_vel
         obj.write_root_state_to_sim(object_states)
 
-        sim.render()  # We don't want physic (sim.step())
+        # Move the offscreen camera with the robot before rendering this frame.
+        # The camera itself is a real Isaac Lab Camera sensor; this works in
+        # --headless mode because --video forces enable_cameras=True above.
+        if camera is not None:
+            target = root_states[:, :3] + camera_lookat_offset
+            eye = root_states[:, :3] + camera_offset
+            camera.set_world_poses_from_view(eye, target)
+
+        # Kinematic replay only: render the state we just wrote; do not advance physics.
+        sim.render()
         scene.update(sim.get_physics_dt())
 
-        pos_lookat = root_states[0, :3].cpu().numpy()
-        sim.set_camera_view(pos_lookat + np.array([2.0, 2.0, 0.5]), pos_lookat)
+        if camera is not None and video_writer is not None:
+            video_writer.append(camera.data.output["rgb"][0])
+
+        # Keep the interactive viewport useful as well.
+        if sim.has_gui():
+            pos_lookat = root_states[0, :3].cpu().numpy()
+            sim.set_camera_view(
+                pos_lookat + np.asarray(args_cli.camera_offset),
+                pos_lookat + np.asarray(args_cli.camera_lookat_offset),
+            )
 
         if not file_saved:
             log["joint_pos"].append(robot.data.joint_pos[0, :].cpu().numpy().copy())
@@ -439,7 +545,9 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
             report_bake_quality(log, motion, robot)
             np.savez(f"{args_cli.output_name}", **log)
             print(f"[INFO]: Motion saved to {args_cli.output_name}")
-            sys.exit(0)
+            if video_writer is not None:
+                video_writer.close()
+            return
 
 
 def report_bake_quality(log: dict, motion: InterMimicMotionLoader, robot):
@@ -483,6 +591,20 @@ def main():
     sim = SimulationContext(sim_cfg)
     # Design scene
     scene_cfg = ReplayMotionsSceneCfg(num_envs=1, env_spacing=2.0)
+    if args_cli.video is not None:
+        scene_cfg.camera = CameraCfg(
+            prim_path="{ENV_REGEX_NS}/RenderCamera",
+            update_period=0.0,
+            height=args_cli.video_height,
+            width=args_cli.video_width,
+            data_types=["rgb"],
+            spawn=sim_utils.PinholeCameraCfg(
+                focal_length=24.0,
+                focus_distance=400.0,
+                horizontal_aperture=20.955,
+                clipping_range=(0.1, 1.0e5),
+            ),
+        )
     scene = InteractiveScene(scene_cfg)
     # Play the simulator
     sim.reset()
@@ -493,7 +615,13 @@ def main():
 
 
 if __name__ == "__main__":
-    # run the main function
+    # Run the one-shot bake/render job. All user outputs (NPZ + MP4) are fully
+    # flushed before main() returns.
     main()
-    # close sim app
-    simulation_app.close()
+
+    # In headless camera workflows, Isaac Sim can hang during its default
+    # graceful shutdown while waiting on Replicator/Kit cleanup. This script is
+    # a one-shot renderer, so there is nothing left to preserve after main().
+    # Skip those shutdown waits and terminate Kit immediately.
+    print("[INFO]: Closing Isaac Sim...", flush=True)
+    simulation_app.close(wait_for_replicator=False, skip_cleanup=True)
