@@ -4,7 +4,7 @@ import torch
 from typing import TYPE_CHECKING, Literal
 
 import isaaclab.utils.math as math_utils
-from isaaclab.assets import Articulation
+from isaaclab.assets import Articulation, RigidObject
 from isaaclab.envs.mdp.events import _randomize_prop_by_op
 from isaaclab.managers import SceneEntityCfg
 
@@ -90,4 +90,35 @@ def randomize_rigid_body_com(
     coms[:, body_ids, :3] += rand_samples
 
     # Set the new coms
+    asset.root_physx_view.set_coms(coms, env_ids)
+
+
+def randomize_rigid_object_com(
+    env: ManagerBasedEnv,
+    env_ids: torch.Tensor | None,
+    com_range: dict[str, tuple[float, float]],
+    asset_cfg: SceneEntityCfg,
+):
+    """Randomize the center of mass (CoM) of a single-body rigid object.
+
+    Separate from :func:`randomize_rigid_body_com` because a ``RigidObject``'s physx view returns
+    CoMs as ``(num_instances, 7)`` while an ``Articulation``'s returns ``(num_instances, num_bodies, 7)``;
+    the articulation-shaped indexing raises on a rigid object.
+
+    .. note::
+        This function uses CPU tensors to assign the CoM. It is recommended to use this function
+        only during the initialization of the environment.
+    """
+    asset: RigidObject = env.scene[asset_cfg.name]
+    if env_ids is None:
+        env_ids = torch.arange(env.scene.num_envs, device="cpu")
+    else:
+        env_ids = env_ids.cpu()
+
+    range_list = [com_range.get(key, (0.0, 0.0)) for key in ["x", "y", "z"]]
+    ranges = torch.tensor(range_list, device="cpu")
+    rand_samples = math_utils.sample_uniform(ranges[:, 0], ranges[:, 1], (len(env_ids), 3), device="cpu")
+
+    coms = asset.root_physx_view.get_coms().clone()
+    coms[env_ids, :3] += rand_samples
     asset.root_physx_view.set_coms(coms, env_ids)

@@ -3,10 +3,9 @@ from __future__ import annotations
 import torch
 from typing import TYPE_CHECKING
 
-from isaaclab.utils.math import matrix_from_quat, quat_apply_inverse, quat_box_minus, subtract_frame_transforms
+from isaaclab.utils.math import matrix_from_quat, subtract_frame_transforms
 
 from booster_train.tasks.manager_based.beyond_mimic.mdp.commands import MotionCommand
-from booster_train.tasks.manager_based.beyond_mimic.mdp.rewards import _body_object_vectors, _hand_object_contact_state
 
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedEnv
@@ -82,98 +81,3 @@ def motion_anchor_ori_b(env: ManagerBasedEnv, command_name: str) -> torch.Tensor
     )
     mat = matrix_from_quat(ori)
     return mat[..., :2].reshape(mat.shape[0], -1)
-
-
-def _object_pose_b(command: MotionCommand) -> tuple[torch.Tensor, torch.Tensor]:
-    """Simulated object pose in the robot anchor frame."""
-    return subtract_frame_transforms(
-        command.robot_anchor_pos_w,
-        command.robot_anchor_quat_w,
-        command.object.data.root_pos_w,
-        command.object.data.root_quat_w,
-    )
-
-
-def _motion_object_pose_b(command: MotionCommand) -> tuple[torch.Tensor, torch.Tensor]:
-    """Reference object pose in the robot anchor frame."""
-    return subtract_frame_transforms(
-        command.robot_anchor_pos_w,
-        command.robot_anchor_quat_w,
-        command.object_pos_w,
-        command.object_quat_w,
-    )
-
-
-def object_pos_residual_b(env: ManagerBasedEnv, command_name: str) -> torch.Tensor:
-    command: MotionCommand = env.command_manager.get_term(command_name)
-
-    sim_pos, _ = _object_pose_b(command)
-    ref_pos, _ = _motion_object_pose_b(command)
-
-    return (sim_pos - ref_pos).view(env.num_envs, -1)
-
-
-def object_ori_residual_b(env: ManagerBasedEnv, command_name: str) -> torch.Tensor:
-    command: MotionCommand = env.command_manager.get_term(command_name)
-
-    _, sim_ori = _object_pose_b(command)
-    _, ref_ori = _motion_object_pose_b(command)
-
-    return quat_box_minus(sim_ori, ref_ori).view(env.num_envs, -1)
-
-
-def object_pos_b(env: ManagerBasedEnv, command_name: str) -> torch.Tensor:
-    command: MotionCommand = env.command_manager.get_term(command_name)
-
-    pos, _ = _object_pose_b(command)
-
-    return pos.view(env.num_envs, -1)
-
-
-def object_ori_b(env: ManagerBasedEnv, command_name: str) -> torch.Tensor:
-    command: MotionCommand = env.command_manager.get_term(command_name)
-
-    _, ori = _object_pose_b(command)
-    mat = matrix_from_quat(ori)
-    return mat[..., :2].reshape(mat.shape[0], -1)
-
-
-def object_lin_vel_b(env: ManagerBasedEnv, command_name: str) -> torch.Tensor:
-    command: MotionCommand = env.command_manager.get_term(command_name)
-
-    vel = quat_apply_inverse(command.robot_anchor_quat_w, command.object.data.root_lin_vel_w)
-    return vel.view(env.num_envs, -1)
-
-
-def object_ang_vel_b(env: ManagerBasedEnv, command_name: str) -> torch.Tensor:
-    command: MotionCommand = env.command_manager.get_term(command_name)
-
-    vel = quat_apply_inverse(command.robot_anchor_quat_w, command.object.data.root_ang_vel_w)
-    return vel.view(env.num_envs, -1)
-
-
-def _in_robot_anchor_frame(command: MotionCommand, vectors: torch.Tensor) -> torch.Tensor:
-    quat = command.robot_anchor_quat_w[:, None].expand(-1, vectors.shape[1], -1)
-    return quat_apply_inverse(quat, vectors).reshape(vectors.shape[0], -1)
-
-
-def body_object_relative_pos_b(env: ManagerBasedEnv, command_name: str, body_names: list[str]) -> torch.Tensor:
-    """Object-to-body vectors of the robot, in the robot anchor frame."""
-    command: MotionCommand = env.command_manager.get_term(command_name)
-    robot, _ = _body_object_vectors(command, body_names)
-    return _in_robot_anchor_frame(command, robot)
-
-
-def motion_body_object_relative_pos_b(env: ManagerBasedEnv, command_name: str, body_names: list[str]) -> torch.Tensor:
-    """Object-to-body vectors of the reference, in the robot anchor frame."""
-    command: MotionCommand = env.command_manager.get_term(command_name)
-    _, reference = _body_object_vectors(command, body_names)
-    return _in_robot_anchor_frame(command, reference)
-
-
-def hand_object_contact(env: ManagerBasedEnv, contact_sensor_names: list[str], force_threshold: float) -> torch.Tensor:
-    """The robot's current 0/1 hand-object contact, channel-for-channel with the command's reference contact.
-
-    Same detection as the contact reward and termination, so all three agree on what counts as contact.
-    """
-    return _hand_object_contact_state(env, contact_sensor_names, force_threshold)

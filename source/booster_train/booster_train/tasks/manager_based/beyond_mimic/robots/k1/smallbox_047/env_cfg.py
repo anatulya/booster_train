@@ -2,7 +2,6 @@ from isaaclab.utils import configclass
 from isaaclab.terrains import TerrainGeneratorCfg
 import isaaclab.terrains as terrain_gen
 from booster_assets import BOOSTER_ASSETS_DIR
-from booster_train.assets.objects.boxes import SMALLBOX_0539923_CFG as OBJECT_CFG
 from booster_train.assets.robots.booster import BOOSTER_K1_CFG as ROBOT_CFG, K1_ACTION_SCALE
 from booster_train.tasks.manager_based.beyond_mimic.agents.rsl_rl_ppo_cfg import LOW_FREQ_SCALE
 from .tracking_env_cfg import TrackingEnvCfg
@@ -20,9 +19,8 @@ class FlatEnvCfg(TrackingEnvCfg):
         super().__post_init__()
 
         self.scene.robot = ROBOT_CFG.replace(prim_path="{ENV_REGEX_NS}/Robot")
-        self.scene.object = OBJECT_CFG.replace(prim_path="{ENV_REGEX_NS}/Object")
         self.actions.joint_pos.scale = K1_ACTION_SCALE
-        self.commands.motion.motion_file = f"{BOOSTER_ASSETS_DIR}/motions/K1/sub4_smallbox_047_hold_from_pt.npz"
+        self.commands.motion.motion_file = f"{BOOSTER_ASSETS_DIR}/motions/K1/sub4_smallbox_047_hold.npz"
         self.commands.motion.anchor_body_name = "Trunk"
         # Keep the episode within one pass of the motion. The base cfg uses 10.0 s, which is
         # longer than this reference and would wrap the playhead mid-episode.

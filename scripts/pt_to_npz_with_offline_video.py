@@ -71,6 +71,13 @@ parser.add_argument(
 parser.add_argument("--output_name", type=str, required=True, help="The name of the motion npz file.")
 parser.add_argument("--output_fps", type=int, default=50, help="The fps of the output motion. Must equal --input_fps.")
 parser.add_argument("--num_dof", type=int, default=22, help="Number of actuated DOF in the source file (K1: 22).")
+parser.add_argument(
+    "--object",
+    type=str,
+    default="smallbox_0539923",
+    choices=("smallbox_0539923", "largebox_0539923"),
+    help="Which captured object the motion interacts with; must match the source capture.",
+)
 parser.add_argument("--video", type=str, default=None, help="Optional output MP4 path for offline rendering.")
 parser.add_argument("--video_width", type=int, default=1280, help="Rendered video width.")
 parser.add_argument("--video_height", type=int, default=720, help="Rendered video height.")
@@ -78,18 +85,68 @@ parser.add_argument(
     "--camera_offset",
     type=float,
     nargs=3,
-    default=(2.0, 2.0, 0.8),
+    default=(1.8, 1.8, 0.6),
     metavar=("X", "Y", "Z"),
-    help="Camera position offset in world axes relative to the robot root.",
+    help="Camera position offset in world axes relative to the look-at point.",
+)
+parser.add_argument(
+    "--camera_view",
+    choices=["world", "front"],
+    default="world",
+    help=(
+        "'world': --camera_offset is in world axes. 'front': --camera_offset is in the robot's heading frame at"
+        " frame 0 (x forward, y left), and defaults to (2.2, 0, 0.6), i.e. looking at the robot's face."
+    ),
+)
+parser.add_argument(
+    "--camera_focal",
+    type=float,
+    default=18.0,
+    help=(
+        "Focal length in mm against a 20.955 mm aperture. 24 mm gives a 28 deg vertical field of view, which"
+        " crops a 1.2 m robot at this distance; 18 mm gives 36 deg."
+    ),
 )
 parser.add_argument(
     "--camera_lookat_offset",
     type=float,
     nargs=3,
-    default=(0.0, 0.0, 0.25),
+    default=(0.0, 0.0, -0.05),
     metavar=("X", "Y", "Z"),
-    help="Camera look-at offset in world axes relative to the robot root.",
+    help=(
+        "Camera look-at offset in world axes. X/Y track the robot root; Z is measured from the standing root"
+        " height of the first frame, so the frame does not dive when the robot squats."
+    ),
 )
+parser.add_argument(
+    "--object_physics",
+    action="store_true",
+    help=(
+        "Simulate the object instead of replaying it: it is placed at its frame-0 pose (on a table slab if it"
+        " starts off the ground) and then only reacts to contact with the kinematically replayed robot. The npz"
+        " then records the simulated object, so write it somewhere other than the training motions."
+    ),
+)
+parser.add_argument("--object_mass", type=float, default=0.5, help="Object mass with --object_physics, kg.")
+parser.add_argument(
+    "--robot_drive",
+    choices=["teleport", "pd"],
+    default="teleport",
+    help=(
+        "With --object_physics: 'teleport' writes the joint angles every substep (the hands are moved into the"
+        " object, not swept, so PhysX only depenetrates it slowly); 'pd' pins the root to the reference but drives"
+        " the joints through the K1 actuators toward the reference, so the arms are real colliding bodies."
+    ),
+)
+parser.add_argument(
+    "--support_size", type=float, nargs=3, default=(0.6, 0.6, 0.04), metavar=("X", "Y", "Z"),
+    help="Table top size with --object_physics, m. Its top face sits at the object's frame-0 bottom.",
+)
+parser.add_argument(
+    "--support_collides_robot", action="store_true",
+    help="Let the robot collide with the table (default: filtered out, so a wide table cannot catch the legs).",
+)
+parser.add_argument("--substeps", type=int, default=4, help="Physics substeps per frame with --object_physics.")
 
 # append AppLauncher cli args
 AppLauncher.add_app_launcher_args(parser)
@@ -121,7 +178,16 @@ from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR
 # Pre-defined configs
 ##
 from booster_train.assets.robots.booster import BOOSTER_K1_CFG as ROBOT_CFG
-from booster_train.assets.objects.boxes import SMALLBOX_0539923_CFG as OBJECT_CFG
+from booster_assets import BOOSTER_ASSETS_DIR
+from booster_train.assets.objects.boxes import LARGEBOX_0539923_CFG, SMALLBOX_0539923_CFG
+
+# The object is only replayed kinematically here, but it has to be the right mesh: the npz carries the object
+# pose straight through, and the rendered video is what tells you the capture and the asset agree.
+OBJECT_CFGS = {"smallbox_0539923": SMALLBOX_0539923_CFG, "largebox_0539923": LARGEBOX_0539923_CFG}
+OBJECT_CFG = OBJECT_CFGS[args_cli.object]
+OBJECT_MESH = f"{BOOSTER_ASSETS_DIR}/motions/K1/{args_cli.object}/{args_cli.object}.obj"
+SUPPORT_SIZE = tuple(args_cli.support_size)
+SUPPORT_MIN_HEIGHT = 0.05
 
 # The source DOF order, one row per actuated joint, in the order the columns appear in the
 # .pt file. Each row lists the aliases this joint is known by, because the InterMimic
@@ -199,6 +265,9 @@ class ReplayMotionsSceneCfg(InteractiveSceneCfg):
 
     # tracked object
     object: RigidObjectCfg = OBJECT_CFG.replace(prim_path="{ENV_REGEX_NS}/Object")
+
+    # Table slab under an object that starts off the ground; only spawned with --object_physics.
+    support: RigidObjectCfg | None = None
 
     # Filled in from main() only when --video is requested, so normal NPZ baking
     # does not pay the camera/rendering cost.
@@ -403,12 +472,16 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
     obj: RigidObject = scene["object"]
     camera: Camera | None = scene["camera"] if args_cli.video is not None else None
     video_writer = Mp4Writer(args_cli.video, args_cli.output_fps) if args_cli.video is not None else None
+    camera_anchor_z = None  # standing root height, captured on the first rendered frame
     camera_offset = torch.tensor(args_cli.camera_offset, device=sim.device, dtype=torch.float32).unsqueeze(0)
     camera_lookat_offset = torch.tensor(
         args_cli.camera_lookat_offset, device=sim.device, dtype=torch.float32
     ).unsqueeze(0)
 
     robot_joint_indexes = resolve_joint_indexes(list(robot.joint_names), K1_DOF_ALIASES)
+    if args_cli.object_physics:
+        setup_object_physics(obj, scene, motion)
+    prev = None  # previous frame's robot state, interpolated across the physics substeps
     if len(robot.joint_names) != len(robot_joint_indexes):
         print(
             f"[WARN]: the robot has {len(robot.joint_names)} joints but the motion only drives"
@@ -462,6 +535,36 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
             reset_flag,
         ) = motion.get_next_state()
 
+        if args_cli.object_physics:
+            # Kinematic robot, physical object: sweep the robot from the previous frame's pose to this one across
+            # the substeps (re-written every substep so gravity and the PD never act on it), and only step physics.
+            cur = (motion_base_pos, motion_base_rot, motion_dof_pos)
+            if prev is None:
+                prev = cur
+            for k in range(1, args_cli.substeps + 1):
+                a = k / args_cli.substeps
+                q0, q1 = prev[1], cur[1]
+                q1 = torch.where((q0 * q1).sum(-1, keepdim=True) < 0, -q1, q1)
+                root_states = robot.data.default_root_state.clone()
+                root_states[:, :3] = (1 - a) * prev[0] + a * cur[0]
+                root_states[:, :2] += scene.env_origins[:, :2]
+                root_states[:, 3:7] = torch.nn.functional.normalize((1 - a) * q0 + a * q1, dim=-1)
+                root_states[:, 7:10] = motion_base_lin_vel
+                root_states[:, 10:] = motion_base_ang_vel
+                robot.write_root_state_to_sim(root_states)
+                joint_pos = robot.data.default_joint_pos.clone()
+                joint_vel = robot.data.default_joint_vel.clone()
+                joint_pos[:, robot_joint_indexes] = (1 - a) * prev[2] + a * cur[2]
+                joint_vel[:, robot_joint_indexes] = motion_dof_vel
+                if args_cli.robot_drive == "teleport" or prev is cur:
+                    robot.write_joint_state_to_sim(joint_pos, joint_vel)
+                robot.set_joint_position_target(joint_pos)
+                robot.set_joint_velocity_target(joint_vel)
+                robot.write_data_to_sim()
+                sim.step(render=False)
+                scene.update(sim.get_physics_dt())
+            prev = cur
+
         # set root state
         root_states = robot.data.default_root_state.clone()
         root_states[:, :3] = motion_base_pos
@@ -478,23 +581,41 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
         joint_vel = robot.data.default_joint_vel.clone()
         joint_pos[:, robot_joint_indexes] = motion_dof_pos
         joint_vel[:, robot_joint_indexes] = motion_dof_vel
-        robot.write_joint_state_to_sim(joint_pos, joint_vel)
+        # With --robot_drive pd the joints are left where the actuators put them (after frame 0).
+        if not (args_cli.object_physics and args_cli.robot_drive == "pd" and log["joint_pos"]):
+            robot.write_joint_state_to_sim(joint_pos, joint_vel)
 
         # set object state (kinematic replay, same convention as the robot root above)
-        object_states = obj.data.default_root_state.clone()
-        object_states[:, :3] = motion_object_pos
-        object_states[:, :2] += scene.env_origins[:, :2]
-        object_states[:, 3:7] = motion_object_rot
-        object_states[:, 7:10] = motion_object_lin_vel
-        object_states[:, 10:] = motion_object_ang_vel
-        obj.write_root_state_to_sim(object_states)
+        if not args_cli.object_physics:
+            object_states = obj.data.default_root_state.clone()
+            object_states[:, :3] = motion_object_pos
+            object_states[:, :2] += scene.env_origins[:, :2]
+            object_states[:, 3:7] = motion_object_rot
+            object_states[:, 7:10] = motion_object_lin_vel
+            object_states[:, 10:] = motion_object_ang_vel
+            obj.write_root_state_to_sim(object_states)
 
         # Move the offscreen camera with the robot before rendering this frame.
         # The camera itself is a real Isaac Lab Camera sensor; this works in
         # --headless mode because --video forces enable_cameras=True above.
         if camera is not None:
+            # Follow the root horizontally only. Tying the look-at height to the root as well makes the frame
+            # dive whenever the robot squats -- which is most of a pick-up motion -- and crops the feet.
+            # The height is pinned to the standing root height of the first frame instead.
+            if camera_anchor_z is None:
+                camera_anchor_z = root_states[0, 2].item()
+                if args_cli.camera_view == "front":
+                    # Rotate the offset by the frame-0 heading only, so the camera does not swing as the robot turns.
+                    w, x, y, z = root_states[0, 3:7].tolist()
+                    yaw = np.arctan2(2 * (w * z + x * y), 1 - 2 * (y * y + z * z))
+                    ox, oy, oz = (2.2, 0.0, 0.6) if tuple(args_cli.camera_offset) == (1.8, 1.8, 0.6) else args_cli.camera_offset
+                    camera_offset = torch.tensor(
+                        [[ox * np.cos(yaw) - oy * np.sin(yaw), ox * np.sin(yaw) + oy * np.cos(yaw), oz]],
+                        device=sim.device, dtype=torch.float32,
+                    )  # fmt: skip
             target = root_states[:, :3] + camera_lookat_offset
-            eye = root_states[:, :3] + camera_offset
+            target[:, 2] = camera_anchor_z + camera_lookat_offset[0, 2]
+            eye = target + camera_offset
             camera.set_world_poses_from_view(eye, target)
 
         # Kinematic replay only: render the state we just wrote; do not advance physics.
@@ -519,10 +640,17 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
             log["body_quat_w"].append(robot.data.body_quat_w[0, :].cpu().numpy().copy())
             log["body_lin_vel_w"].append(robot.data.body_lin_vel_w[0, :].cpu().numpy().copy())
             log["body_ang_vel_w"].append(robot.data.body_ang_vel_w[0, :].cpu().numpy().copy())
-            log["object_pos_w"].append(motion_object_pos[0, :].cpu().numpy().copy())
-            log["object_quat_w"].append(motion_object_rot[0, :].cpu().numpy().copy())
-            log["object_lin_vel_w"].append(motion_object_lin_vel[0, :].cpu().numpy().copy())
-            log["object_ang_vel_w"].append(motion_object_ang_vel[0, :].cpu().numpy().copy())
+            if args_cli.object_physics:
+                log["object_pos_w"].append((obj.data.root_pos_w[0] - scene.env_origins[0]).cpu().numpy().copy())
+                log["object_quat_w"].append(obj.data.root_quat_w[0].cpu().numpy().copy())
+                log["object_lin_vel_w"].append(obj.data.root_lin_vel_w[0].cpu().numpy().copy())
+                log["object_ang_vel_w"].append(obj.data.root_ang_vel_w[0].cpu().numpy().copy())
+                log.setdefault("ref_object_pos_w", []).append(motion_object_pos[0].cpu().numpy().copy())
+            else:
+                log["object_pos_w"].append(motion_object_pos[0, :].cpu().numpy().copy())
+                log["object_quat_w"].append(motion_object_rot[0, :].cpu().numpy().copy())
+                log["object_lin_vel_w"].append(motion_object_lin_vel[0, :].cpu().numpy().copy())
+                log["object_ang_vel_w"].append(motion_object_ang_vel[0, :].cpu().numpy().copy())
             log["contact"].append(motion_contact[0, :].cpu().numpy().copy())
 
         if reset_flag and not file_saved:
@@ -543,11 +671,65 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
                 log[k] = np.stack(log[k], axis=0)
 
             report_bake_quality(log, motion, robot)
+            if args_cli.object_physics:
+                ref_obj = np.stack(log.pop("ref_object_pos_w"))
+                sim_obj = log["object_pos_w"]
+                err = np.linalg.norm(sim_obj - ref_obj, axis=-1)
+                z0 = ref_obj[0, 2]
+                lifted = ref_obj[:, 2] > z0 + 0.10
+                print(f"[PHYSICS]: object max lift  sim {sim_obj[:, 2].max() - z0:+.3f} m   ref {ref_obj[:, 2].max() - z0:+.3f} m")
+                print(f"[PHYSICS]: object error     mean {err.mean():.3f} m   max {err.max():.3f} m   final {err[-1]:.3f} m")
+                if lifted.any():
+                    print(f"[PHYSICS]: carried (within 10 cm while ref lifted): {(err[lifted] < 0.10).mean() * 100:.0f}%")
             np.savez(f"{args_cli.output_name}", **log)
             print(f"[INFO]: Motion saved to {args_cli.output_name}")
             if video_writer is not None:
                 video_writer.close()
             return
+
+
+def setup_object_physics(obj: RigidObject, scene: InteractiveScene, motion: "InterMimicMotionLoader"):
+    """Mass, collider offsets, frame-0 pose and table slab for a physically simulated object."""
+    import trimesh
+
+    view = obj.root_physx_view
+    ids = torch.arange(view.count, device="cpu")
+    mass0 = view.get_masses().clone()
+    view.set_masses(torch.full_like(mass0, args_cli.object_mass), ids)
+    view.set_inertias(view.get_inertias() * (args_cli.object_mass / mass0.view(-1, 1)), ids)
+    view.set_contact_offsets(torch.full_like(view.get_contact_offsets(), 0.02), ids)
+    view.set_rest_offsets(torch.full_like(view.get_rest_offsets(), 0.001), ids)
+
+    pos0, quat0 = motion.motion_object_poss[0], motion.motion_object_rots[0]
+    state = obj.data.default_root_state.clone()
+    state[:, :3] = pos0
+    state[:, :2] += scene.env_origins[:, :2]
+    state[:, 3:7] = quat0
+    state[:, 7:] = 0.0
+    obj.write_root_state_to_sim(state)
+
+    w, x, y, z = quat0.cpu().numpy()
+    rot = np.array([
+        [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+        [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+        [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
+    ])  # fmt: skip
+    vertices = np.asarray(trimesh.load(OBJECT_MESH, force="mesh").vertices)
+    bottom = float((vertices @ rot.T)[:, 2].min() + pos0[2].item())
+    support = scene["support"]
+    slab = support.data.default_root_state.clone()
+    slab[:, 3:7] = torch.tensor([1.0, 0.0, 0.0, 0.0], device=slab.device)
+    if bottom > SUPPORT_MIN_HEIGHT:
+        slab[:, :3] = torch.tensor([pos0[0].item(), pos0[1].item(), bottom - 0.5 * SUPPORT_SIZE[2]], device=slab.device)
+        slab[:, :2] += scene.env_origins[:, :2]
+    else:
+        slab[:, :3] = torch.tensor([0.0, 0.0, -10.0], device=slab.device)
+    support.write_root_state_to_sim(slab)
+    print(
+        f"[PHYSICS]: object {args_cli.object_mass} kg, bottom {bottom:+.3f} m ->"
+        f" {'table slab' if bottom > SUPPORT_MIN_HEIGHT else 'floor'}; robot kinematic, object simulated",
+        flush=True,
+    )
 
 
 def report_bake_quality(log: dict, motion: InterMimicMotionLoader, robot):
@@ -588,9 +770,22 @@ def main():
     # Load kit helper
     sim_cfg = sim_utils.SimulationCfg(device=args_cli.device)
     sim_cfg.dt = 1.0 / args_cli.output_fps
+    if args_cli.object_physics:
+        sim_cfg.dt /= args_cli.substeps  # 0.005 s at 50 fps, as in training
     sim = SimulationContext(sim_cfg)
     # Design scene
     scene_cfg = ReplayMotionsSceneCfg(num_envs=1, env_spacing=2.0)
+    if args_cli.object_physics:
+        scene_cfg.support = RigidObjectCfg(
+            prim_path="{ENV_REGEX_NS}/Support",
+            spawn=sim_utils.CuboidCfg(
+                size=SUPPORT_SIZE,
+                rigid_props=sim_utils.RigidBodyPropertiesCfg(kinematic_enabled=True),
+                collision_props=sim_utils.CollisionPropertiesCfg(),
+                visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.35, 0.3, 0.25)),
+            ),
+            init_state=RigidObjectCfg.InitialStateCfg(pos=(0.0, 0.0, -10.0)),
+        )
     if args_cli.video is not None:
         scene_cfg.camera = CameraCfg(
             prim_path="{ENV_REGEX_NS}/RenderCamera",
@@ -599,13 +794,28 @@ def main():
             width=args_cli.video_width,
             data_types=["rgb"],
             spawn=sim_utils.PinholeCameraCfg(
-                focal_length=24.0,
+                focal_length=args_cli.camera_focal,
                 focus_distance=400.0,
                 horizontal_aperture=20.955,
                 clipping_range=(0.1, 1.0e5),
             ),
         )
     scene = InteractiveScene(scene_cfg)
+    if args_cli.object_physics and not args_cli.support_collides_robot:
+        # Table only touches the object: filter every robot link against it (must be authored before sim.reset()).
+        from pxr import Usd, UsdPhysics
+
+        stage = sim.stage
+        for env_ns in scene.env_prim_paths:
+            rel = UsdPhysics.FilteredPairsAPI.Apply(stage.GetPrimAtPath(f"{env_ns}/Support")).CreateFilteredPairsRel()
+            links = [
+                prim.GetPath()
+                for prim in Usd.PrimRange(stage.GetPrimAtPath(f"{env_ns}/Robot"))
+                if prim.HasAPI(UsdPhysics.RigidBodyAPI)
+            ]
+            for link in links:
+                rel.AddTarget(link)
+        print(f"[PHYSICS]: table collision filtered against {len(links)} robot links", flush=True)
     # Play the simulator
     sim.reset()
     # Now we are ready!
