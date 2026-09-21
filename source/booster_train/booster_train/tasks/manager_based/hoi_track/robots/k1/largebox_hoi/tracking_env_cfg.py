@@ -42,10 +42,20 @@ CONTACT_SIGMA_F = 1.0
 # Early termination. Looser than the reward's 2 N grip threshold on purpose: the gap between 1 N (failure) and
 # 2 N (success) is a deadband where a hand is neither paid in full nor killed.
 #
-# OBJECT_POS_TERMINATION is measured in the robot's heading frame (see bad_object_pos), not in world, so it is
+# OBJECT_POS_TERMINATION is measured in the robot's heading frame (see BadObjectPos), not in world, so it is
 # a budget for "the box is misplaced relative to me" and not for global drift. The world-frame version of this
 # check fired on 40.6% of episodes at 5.7k iterations, almost all of it root drift rather than dropping.
+#
+# OBJECT_POS_STEPS mirrors LOST_CONTACT_STEPS: an env reset into the lift-off spawns the box in mid-air with
+# the reference already asking for a grip, and had ~16 steps before free fall breached the bound. The counter
+# gives it time to close the hands instead of dying on the reset condition.
 OBJECT_POS_TERMINATION = 0.5
+OBJECT_POS_STEPS = 25
+# 1.2 rad (69 deg) clears the motion's own object rotation: measured from its start in the root heading frame,
+# the reference box turns at most 0.924 rad (sub1) / 0.569 rad (sub15) and never spends a frame past 1.2. So
+# this cannot fire on a policy that simply fails to rotate the box -- it only catches genuine tipping.
+OBJECT_ORI_TERMINATION = 1.2
+OBJECT_ORI_STEPS = 25
 LOST_CONTACT_FORCE = 1.0
 LOST_CONTACT_DISTANCE = 0.2
 LOST_CONTACT_STEPS = 25
@@ -171,7 +181,11 @@ class CommandsCfg:
 class ActionsCfg:
     """Action specifications for the MDP."""
 
-    joint_pos = mdp.JointPositionActionCfg(asset_name="robot", joint_names=[".*"], use_default_offset=True)
+    # Residual on the reference pose rather than on the default stance: a zero action commands the reference
+    # exactly, so the policy starts by roughly tracking and only learns the correction. See mdp/actions.py.
+    joint_pos = mdp.ResidualJointPositionActionCfg(
+        asset_name="robot", joint_names=[".*"], use_default_offset=True, command_name="motion"
+    )
 
 
 @configclass
@@ -415,8 +429,12 @@ class TerminationsCfg:
         },
     )
     object_pos = DoneTerm(
-        func=mdp.bad_object_pos,
-        params={"command_name": "motion", "threshold": OBJECT_POS_TERMINATION},
+        func=mdp.BadObjectPos,
+        params={"command_name": "motion", "threshold": OBJECT_POS_TERMINATION, "max_steps": OBJECT_POS_STEPS},
+    )
+    object_ori = DoneTerm(
+        func=mdp.BadObjectOri,
+        params={"command_name": "motion", "threshold": OBJECT_ORI_TERMINATION, "max_steps": OBJECT_ORI_STEPS},
     )
     lost_contact = DoneTerm(
         func=mdp.LostContact,
