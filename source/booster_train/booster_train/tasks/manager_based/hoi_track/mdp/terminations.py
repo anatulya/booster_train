@@ -13,6 +13,7 @@ from isaaclab.assets import Articulation, RigidObject
 from isaaclab.managers import ManagerTermBase, SceneEntityCfg, TerminationTermCfg
 
 from booster_train.tasks.manager_based.hoi_track.mdp.commands import MotionCommand
+from booster_train.tasks.manager_based.hoi_track.mdp.geometry import rotate_into_heading
 from booster_train.tasks.manager_based.hoi_track.mdp.rewards import _get_body_indexes, hand_object_normal_force
 
 
@@ -60,13 +61,33 @@ def bad_motion_body_pos_z_only(
 
 
 def bad_object_pos(env: ManagerBasedRLEnv, command_name: str, threshold: float) -> torch.Tensor:
-    """The simulated object has strayed from its reference pose, in world frame.
+    """The object is not where the robot should be holding it, measured in the robot's own heading frame.
 
-    Note this also fires when the *robot* drifts while carrying the object correctly, since the reference is
-    world-anchored. ``bad_anchor_pos_z_only`` deliberately tolerates horizontal robot drift; this one does not.
+    Both sides are object-minus-anchor, each rotated into its own yaw-only frame::
+
+        rel_now = R_heading(robot_anchor)^T (p_object      - p_robot_anchor)
+        rel_ref = R_heading(ref_anchor)^T   (p_object_ref  - p_ref_anchor)
+        fire if ||rel_now - rel_ref|| > threshold
+
+    so the robot's global position and yaw cancel and what is left is "is the box where you should be holding
+    it". This replaces an earlier world-frame check, which measured the object against a world-anchored
+    reference and so fired whenever the *robot* drifted while carrying the object correctly. That made it the
+    dominant termination -- 40.6% of episodes at iteration 5.7k -- while the object's mean position error
+    (0.183 m) was indistinguishable from the robot's own anchor error (0.182 m), i.e. the object was riding
+    along with root drift rather than being dropped.
+
+    It also restores consistency with ``bad_anchor_pos_z_only``, which tolerates horizontal robot drift by
+    design. Global object accuracy is still paid for by ``motion_global_object_position_error_exp`` (weight
+    10), which is the right place for it: a gradient, not a kill switch.
+
+    Heading frames rather than full orientation, matching ``object_pos_b``: the trunk pitches 40 degrees or
+    more during a pick-up, and rotating the comparison by that pitch would manufacture error out of a posture
+    difference that ``LostContact`` already covers.
     """
     command: MotionCommand = env.command_manager.get_term(command_name)
-    return torch.norm(command.object_pos_w - command.robot_object_pos_w, dim=1) > threshold
+    rel_now = rotate_into_heading(command.robot_anchor_quat_w, command.robot_object_pos_w - command.robot_anchor_pos_w)
+    rel_ref = rotate_into_heading(command.anchor_quat_w, command.object_pos_w - command.anchor_pos_w)
+    return torch.norm(rel_now - rel_ref, dim=1) > threshold
 
 
 class LostContact(ManagerTermBase):

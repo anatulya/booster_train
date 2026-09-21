@@ -41,6 +41,10 @@ CONTACT_SIGMA_F = 1.0
 
 # Early termination. Looser than the reward's 2 N grip threshold on purpose: the gap between 1 N (failure) and
 # 2 N (success) is a deadband where a hand is neither paid in full nor killed.
+#
+# OBJECT_POS_TERMINATION is measured in the robot's heading frame (see bad_object_pos), not in world, so it is
+# a budget for "the box is misplaced relative to me" and not for global drift. The world-frame version of this
+# check fired on 40.6% of episodes at 5.7k iterations, almost all of it root drift rather than dropping.
 OBJECT_POS_TERMINATION = 0.5
 LOST_CONTACT_FORCE = 1.0
 LOST_CONTACT_DISTANCE = 0.2
