@@ -23,6 +23,8 @@ parser.add_argument("--policy", required=True, help="TorchScript policy exported
 parser.add_argument("--clip", default="sub12_largebox_014", help="Clip name under motions/K1/tracker/npz.")
 parser.add_argument("--out", default="logs/eval_box")
 parser.add_argument("--tag", default=None, help="Suffix for the output files (default: policy file stem).")
+parser.add_argument("--object", choices=["largebox_0539923", "suitcase_0539923", "suitcase_0674904", "suitcase_tall15", "suitcase_tall18", "suitcase_tall15_w125", "suitcase_tall15_w140"], default="largebox_0539923",
+                    help="Captured object of the clip; must match what the reference interacted with.")  # fmt: skip
 parser.add_argument("--box_mass", type=float, default=0.5)
 parser.add_argument("--friction", type=float, default=None,
                     help="Static/dynamic friction for robot and box; default: the scene's material (1.0, multiply).")  # fmt: skip
@@ -32,8 +34,12 @@ parser.add_argument("--box_shift", type=float, default=0.0,
                     help="Move the box (and slab) this far toward the robot root along the root->box line, m.")  # fmt: skip
 parser.add_argument("--box_offset", type=float, nargs=2, default=(0.0, 0.0), metavar=("DX", "DY"),
                     help="World-frame xy offset added to the box (and slab) start, m; e.g. the policy's root drift.")  # fmt: skip
+parser.add_argument("--camera_view", choices=["side", "front"], default="side",
+                    help="'side': perpendicular to the robot->object line. 'front': in front of the robot, along its frame-0 heading.")  # fmt: skip
 parser.add_argument("--width", type=int, default=960)
 parser.add_argument("--height", type=int, default=720)
+parser.add_argument("--hands", choices=["stock", "big"], default="stock",
+                    help="'big' swaps in the K1 variant with a collision pad on each palm (make_bighands_urdf.py).")  # fmt: skip
 parser.add_argument("--contact_threshold", type=float, default=0.1)
 AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
@@ -52,13 +58,32 @@ from isaaclab.envs import ManagerBasedRLEnv
 from isaaclab.sensors import CameraCfg, ContactSensorCfg
 
 from booster_assets import BOOSTER_ASSETS_DIR
-from booster_train.assets.objects.boxes import LARGEBOX_0539923_CFG
+from booster_train.assets.robots.booster import BOOSTER_K1_BIGHANDS_CFG
+from booster_train.assets.objects.boxes import (
+    LARGEBOX_0539923_CFG,
+    SUITCASE_0539923_CFG,
+    SUITCASE_0674904_CFG,
+    SUITCASE_TALL15_CFG,
+    SUITCASE_TALL15_W125_CFG,
+    SUITCASE_TALL15_W140_CFG,
+    SUITCASE_TALL18_CFG,
+)
 from booster_train.tasks.manager_based.beyond_mimic.robots.k1.largebox_tracker.env_cfg import (
     PlayFlatWoStateEstimationEnvCfg,
 )
 
-BOX_LINK = "largebox_0539923_link"
-BOX_MESH = f"{BOOSTER_ASSETS_DIR}/motions/K1/largebox_0539923/largebox_0539923.obj"
+OBJECT_CFGS = {
+    "largebox_0539923": LARGEBOX_0539923_CFG,
+    "suitcase_0539923": SUITCASE_0539923_CFG,
+    "suitcase_0674904": SUITCASE_0674904_CFG,
+    "suitcase_tall15": SUITCASE_TALL15_CFG,
+    "suitcase_tall18": SUITCASE_TALL18_CFG,
+    "suitcase_tall15_w125": SUITCASE_TALL15_W125_CFG,
+    "suitcase_tall15_w140": SUITCASE_TALL15_W140_CFG,
+}
+OBJECT_CFG = OBJECT_CFGS[args_cli.object]
+BOX_LINK = f"{args_cli.object}_link"
+BOX_MESH = f"{BOOSTER_ASSETS_DIR}/motions/K1/{args_cli.object}/{args_cli.object}.obj"
 # Same slab as replay_pd_references.py: barely wider than the box so the robot cannot stand on it.
 SUPPORT_HEIGHT = 0.5
 
@@ -93,7 +118,11 @@ def build_cfg(motion_file: str, box_pos, box_quat, support_pos) -> PlayFlatWoSta
         setattr(cfg.terminations, name, None)
     cfg.episode_length_s = 60.0
 
-    cfg.scene.object = LARGEBOX_0539923_CFG.replace(
+    if args_cli.hands == "big":
+        # Same articulation, only the palm colliders differ, so the exported policy loads unchanged.
+        cfg.scene.robot = BOOSTER_K1_BIGHANDS_CFG.replace(prim_path="{ENV_REGEX_NS}/Robot")
+
+    cfg.scene.object = OBJECT_CFG.replace(
         prim_path="{ENV_REGEX_NS}/Object",
         init_state=RigidObjectCfg.InitialStateCfg(pos=tuple(box_pos), rot=tuple(box_quat)),
     )
@@ -219,9 +248,17 @@ def main():
     mid = 0.5 * (root0[:2] + box_pos0[:2])
     d = box_pos0[:2] - root0[:2]
     d = d / max(np.linalg.norm(d), 1e-6)
-    perp = np.array([-d[1], d[0]])
-    target = torch.tensor([[mid[0], mid[1], 0.45]], device=device, dtype=torch.float32) + origin
-    eye = target + torch.tensor([[perp[0] * 2.4, perp[1] * 2.4, 0.6]], device=device, dtype=torch.float32)
+    if args_cli.camera_view == "front":
+        # Face the robot: out along its frame-0 heading, so the object sits between camera and robot.
+        q = ref["body_quat_w"][0, 0]
+        yaw = np.arctan2(2 * (q[0] * q[3] + q[1] * q[2]), 1 - 2 * (q[2] ** 2 + q[3] ** 2))
+        offset = np.array([np.cos(yaw) * 2.6, np.sin(yaw) * 2.6, 0.7])
+        target = torch.tensor([[root0[0], root0[1], 0.45]], device=device, dtype=torch.float32) + origin
+    else:
+        perp = np.array([-d[1], d[0]])
+        offset = np.array([perp[0] * 2.4, perp[1] * 2.4, 0.6])
+        target = torch.tensor([[mid[0], mid[1], 0.45]], device=device, dtype=torch.float32) + origin
+    eye = target + torch.tensor([offset], device=device, dtype=torch.float32)
 
     tag = args_cli.tag or Path(args_cli.policy).stem
     os.makedirs(args_cli.out, exist_ok=True)

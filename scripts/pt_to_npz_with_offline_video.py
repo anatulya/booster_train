@@ -48,6 +48,8 @@ link geometry than the Booster K1 model the policy is trained against.
 """Launch Isaac Sim Simulator first."""
 
 import argparse
+import math
+import os
 import sys
 from pathlib import Path
 import numpy as np
@@ -75,7 +77,7 @@ parser.add_argument(
     "--object",
     type=str,
     default="smallbox_0539923",
-    choices=("smallbox_0539923", "largebox_0539923"),
+    choices=("smallbox_0539923", "largebox_0539923", "suitcase_0539923", "suitcase_0674904", "suitcase_tall15", "suitcase_tall18", "suitcase_tall15_w125", "suitcase_tall15_w140"),
     help="Which captured object the motion interacts with; must match the source capture.",
 )
 parser.add_argument("--video", type=str, default=None, help="Optional output MP4 path for offline rendering.")
@@ -127,6 +129,44 @@ parser.add_argument(
         " then records the simulated object, so write it somewhere other than the training motions."
     ),
 )
+parser.add_argument(
+    "--stand_s",
+    type=float,
+    default=0.0,
+    help=(
+        "Append a transition of this many seconds from the clip's last pose to the robot's default standing pose"
+        " (see --stand_pose; trunk upright, same heading). Joints follow a cubic Hermite curve"
+        " that starts at the clip's final joint velocity and ends at rest; the root is placed every frame so the"
+        " lower foot stays on the ground and the feet midpoint stays put. Hold the result with append_hold_npz.py."
+    ),
+)
+parser.add_argument(
+    "--stand_pose",
+    choices=["prepare", "default"],
+    default="prepare",
+    help=(
+        "Standing pose that --stand_s ends in. 'prepare': booster_deploy's K1 prepare_state pose (knees 0.105,"
+        " ankles -0.10, arms down) -- the pose the real robot starts from. 'default': BOOSTER_K1_CFG default joint"
+        " angles (straight legs)."
+    ),
+)
+parser.add_argument(
+    "--start_s",
+    type=float,
+    default=0.0,
+    help=(
+        "Prepend a transition of this many seconds from the robot's standing pose (see --start_pose) into the"
+        " clip's first pose, so the motion begins where the real robot begins. Joints follow a cubic Hermite"
+        " curve that starts at rest and arrives with the clip's initial joint velocity; the root is placed every"
+        " frame so the feet stay where the clip's first frame puts them."
+    ),
+)
+parser.add_argument(
+    "--start_pose",
+    choices=["prepare", "default"],
+    default="prepare",
+    help="Standing pose that --start_s begins from; same choices as --stand_pose.",
+)
 parser.add_argument("--object_mass", type=float, default=0.5, help="Object mass with --object_physics, kg.")
 parser.add_argument(
     "--robot_drive",
@@ -145,6 +185,27 @@ parser.add_argument(
 parser.add_argument(
     "--support_collides_robot", action="store_true",
     help="Let the robot collide with the table (default: filtered out, so a wide table cannot catch the legs).",
+)
+parser.add_argument(
+    "--show_contact_points",
+    action="store_true",
+    help=(
+        "Draw the two palm keypoints into the video (grey when the reference reports no contact, green when it"
+        " does) and report how far they sit from the object surface over the labelled contact frames. This is how"
+        " --palm_offset is verified: the K1's *_hand_link origin is at the forearm end, not the palm."
+    ),
+)
+parser.add_argument(
+    "--palm_offset",
+    type=float,
+    nargs="+",
+    default=[0.20],
+    metavar="V",
+    help=(
+        "Palm keypoint offset in the hand link's frame, m -- the K1's *_hand_link origin sits at the forearm"
+        " end, not the palm. One value is the y-only convention (left +y, right -y); three values give the left"
+        " hand's full offset and the right hand mirrors it in y."
+    ),
 )
 parser.add_argument("--substeps", type=int, default=4, help="Physics substeps per frame with --object_physics.")
 
@@ -167,6 +228,7 @@ simulation_app = app_launcher.app
 import torch
 
 import isaaclab.sim as sim_utils
+from isaaclab.utils.math import quat_apply, quat_conjugate, quat_mul
 from isaaclab.assets import ArticulationCfg, AssetBaseCfg, RigidObject, RigidObjectCfg
 from isaaclab.scene import InteractiveScene, InteractiveSceneCfg
 from isaaclab.sensors import Camera, CameraCfg
@@ -179,11 +241,29 @@ from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR
 ##
 from booster_train.assets.robots.booster import BOOSTER_K1_CFG as ROBOT_CFG
 from booster_assets import BOOSTER_ASSETS_DIR
-from booster_train.assets.objects.boxes import LARGEBOX_0539923_CFG, SMALLBOX_0539923_CFG
+from booster_train.assets.objects.boxes import (
+    LARGEBOX_0539923_CFG,
+    SMALLBOX_0539923_CFG,
+    SUITCASE_0539923_CFG,
+    SUITCASE_0674904_CFG,
+    SUITCASE_TALL15_CFG,
+    SUITCASE_TALL15_W125_CFG,
+    SUITCASE_TALL15_W140_CFG,
+    SUITCASE_TALL18_CFG,
+)
 
 # The object is only replayed kinematically here, but it has to be the right mesh: the npz carries the object
 # pose straight through, and the rendered video is what tells you the capture and the asset agree.
-OBJECT_CFGS = {"smallbox_0539923": SMALLBOX_0539923_CFG, "largebox_0539923": LARGEBOX_0539923_CFG}
+OBJECT_CFGS = {
+    "smallbox_0539923": SMALLBOX_0539923_CFG,
+    "largebox_0539923": LARGEBOX_0539923_CFG,
+    "suitcase_0539923": SUITCASE_0539923_CFG,
+    "suitcase_0674904": SUITCASE_0674904_CFG,
+    "suitcase_tall15": SUITCASE_TALL15_CFG,
+    "suitcase_tall18": SUITCASE_TALL18_CFG,
+    "suitcase_tall15_w125": SUITCASE_TALL15_W125_CFG,
+    "suitcase_tall15_w140": SUITCASE_TALL15_W140_CFG,
+}
 OBJECT_CFG = OBJECT_CFGS[args_cli.object]
 OBJECT_MESH = f"{BOOSTER_ASSETS_DIR}/motions/K1/{args_cli.object}/{args_cli.object}.obj"
 SUPPORT_SIZE = tuple(args_cli.support_size)
@@ -219,6 +299,16 @@ K1_DOF_ALIASES = [
     ("Right_Ankle_Roll", "right_ankle_roll_joint"),
 ]
 
+# booster_deploy K1_CFG.prepare_state.joint_pos: the pose the real robot is put in before the policy starts. Listed in
+# the source DOF order above (head, left arm, right arm, left leg, right leg), which is also booster_deploy's order.
+K1_PREPARE_POSE = [
+    0.0, 0.0,
+    0.0, -1.3, 0.0, 0.0,
+    0.0, 1.3, 0.0, 0.0,
+    0.0, 0.0, 0.0, 0.105, -0.10, 0.0,
+    0.0, 0.0, 0.0, 0.105, -0.10, 0.0,
+]  # fmt: skip
+
 # Bodies the shipped K1 tracking tasks ask for. Only used to warn when the spawned model
 # cannot supply them, which means the baked npz will not load in those tasks.
 TASK_BODY_NAMES = [
@@ -237,6 +327,12 @@ TASK_BODY_NAMES = [
     "Right_Arm_3",
     "right_hand_link",
 ]
+
+# Palm keypoints for --show_contact_points. The K1's *_hand_link origin sits at the forearm end, roughly
+# --palm_offset metres from the palm along the link's local y, so a contact point taken from the link origin
+# alone is off by more than the object is wide. Sign is +y on the left hand, -y on the right.
+PALM_BODY_NAMES = ("left_hand_link", "right_hand_link")
+PALM_SIGNS = (1.0, -1.0)
 
 # Contact channels carried into the npz, as (source contact index, K1 body name).
 CONTACT_CHANNELS = [(6, "left_hand_link"), (11, "right_hand_link")]
@@ -479,6 +575,49 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
     ).unsqueeze(0)
 
     robot_joint_indexes = resolve_joint_indexes(list(robot.joint_names), K1_DOF_ALIASES)
+    foot_ids = [robot.body_names.index(name) for name in ("left_foot_link", "right_foot_link")]
+    palm_ids = [robot.body_names.index(name) for name in PALM_BODY_NAMES]
+    palm_offsets = torch.tensor(palm_offset_vectors(cli_palm_offset()), device=sim.device, dtype=torch.float32)
+    palm_markers = None
+    if args_cli.show_contact_points:
+        from isaaclab.markers import VisualizationMarkers, VisualizationMarkersCfg
+
+        palm_markers = VisualizationMarkers(
+            VisualizationMarkersCfg(
+                prim_path="/Visuals/ContactPoints",
+                markers={
+                    # palm keypoint: grey while the reference reports no contact, green while it does
+                    "free": sim_utils.SphereCfg(
+                        radius=0.015,
+                        visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.65, 0.65, 0.65)),
+                    ),
+                    "contact": sim_utils.SphereCfg(
+                        radius=0.030,
+                        visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.1, 0.9, 0.2)),
+                    ),
+                    # the observation's contact target, rigidly attached to the object
+                    "target": sim_utils.SphereCfg(
+                        radius=0.022,
+                        visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(1.0, 0.45, 0.0)),
+                    ),
+                },
+            )
+        )
+    stand_start = None
+    lead_frames = 0
+    lead_feet_ref = None
+    feet_ref = None  # feet on the last clip frame, captured in the loop
+    prev_root = None
+    # Lead-in first: it shifts every later frame index, including the one append_stand_transition reports.
+    if args_cli.start_s > 0:
+        lead_frames, lead_feet_ref = prepend_start_transition(
+            motion, robot, robot_joint_indexes, sim, scene, foot_ids
+        )
+    if args_cli.stand_s > 0:
+        stand_start = append_stand_transition(motion, robot, robot_joint_indexes)
+    contact_targets = None
+    if args_cli.show_contact_points:
+        contact_targets = precompute_contact_targets(motion, robot, sim, scene, palm_ids, palm_offsets)
     if args_cli.object_physics:
         setup_object_physics(obj, scene, motion)
     prev = None  # previous frame's robot state, interpolated across the physics substeps
@@ -585,6 +724,35 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
         if not (args_cli.object_physics and args_cli.robot_drive == "pd" and log["joint_pos"]):
             robot.write_joint_state_to_sim(joint_pos, joint_vel)
 
+        if stand_start is not None or lead_frames:
+            frame = len(log["joint_pos"])  # index of the frame being written
+            # Which clip frame's feet this synthetic frame has to stand on: the clip's first for the lead-in,
+            # its last for the stand transition, and neither for the clip itself.
+            synthetic_ref = None
+            if frame < lead_frames:
+                synthetic_ref = lead_feet_ref
+            elif stand_start is not None and frame >= stand_start:
+                synthetic_ref = feet_ref
+            if synthetic_ref is not None:
+                # Root placement for the synthetic transition: FK with the guessed root, then shift it so the lower
+                # foot is at the height the reference frame's feet had and the feet midpoint does not drift.
+                sim.physics_sim_view.update_articulations_kinematic()
+                robot.update(0.0)
+                feet = robot.data.body_pos_w[0, foot_ids]
+                shift = torch.zeros(3, device=sim.device)
+                shift[:2] = synthetic_ref[:, :2].mean(0) - feet[:, :2].mean(0)
+                shift[2] = synthetic_ref[:, 2].min() - feet[:, 2].min()
+                root_states[:, :3] += shift
+                if prev_root is not None:
+                    dt = 1.0 / args_cli.output_fps
+                    root_states[:, 7:10] = (root_states[:, :3] - prev_root[:, :3]) / dt
+                    dq = quat_mul(root_states[:, 3:7], quat_conjugate(prev_root[:, 3:7]))
+                    dq = torch.where(dq[:, :1] < 0, -dq, dq)
+                    root_states[:, 10:] = 2.0 * dq[:, 1:] / dt
+                robot.write_root_state_to_sim(root_states)
+                robot.write_joint_state_to_sim(joint_pos, joint_vel)
+            prev_root = root_states.clone()
+
         # set object state (kinematic replay, same convention as the robot root above)
         if not args_cli.object_physics:
             object_states = obj.data.default_root_state.clone()
@@ -594,6 +762,30 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
             object_states[:, 7:10] = motion_object_lin_vel
             object_states[:, 10:] = motion_object_ang_vel
             obj.write_root_state_to_sim(object_states)
+
+        if palm_markers is not None:
+            # Refresh the link poses the markers hang off. Under --robot_drive pd the physics step already did.
+            if not (args_cli.object_physics and args_cli.robot_drive == "pd"):
+                sim.physics_sim_view.update_articulations_kinematic()
+            robot.update(0.0)
+            palms = robot.data.body_pos_w[0, palm_ids] + quat_apply(robot.data.body_quat_w[0, palm_ids], palm_offsets)
+            # The target rides the object, so it is mapped through whatever pose the object actually has now.
+            if args_cli.object_physics:
+                obj_pos_now, obj_quat_now = obj.data.root_pos_w[0], obj.data.root_quat_w[0]
+            else:
+                obj_pos_now = motion_object_pos[0] + scene.env_origins[0]
+                obj_quat_now = motion_object_rot[0]
+            frame_index = min(len(log["joint_pos"]), contact_targets.shape[0] - 1)
+            targets = obj_pos_now + quat_apply(
+                obj_quat_now.expand(contact_targets.shape[1], 4), contact_targets[frame_index]
+            )
+            palm_markers.visualize(
+                translations=torch.cat([palms, targets], dim=0),
+                marker_indices=torch.cat([
+                    (motion_contact[0] > 0.5).long(),
+                    torch.full((targets.shape[0],), 2, dtype=torch.long, device=sim.device),
+                ]),
+            )
 
         # Move the offscreen camera with the robot before rendering this frame.
         # The camera itself is a real Isaac Lab Camera sensor; this works in
@@ -633,6 +825,10 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
                 pos_lookat + np.asarray(args_cli.camera_lookat_offset),
             )
 
+        if stand_start is not None and len(log["joint_pos"]) == stand_start - 1 and feet_ref is None:
+            sim.physics_sim_view.update_articulations_kinematic()
+            robot.update(0.0)
+            feet_ref = robot.data.body_pos_w[0, foot_ids].clone()
         if not file_saved:
             log["joint_pos"].append(robot.data.joint_pos[0, :].cpu().numpy().copy())
             log["joint_vel"].append(robot.data.joint_vel[0, :].cpu().numpy().copy())
@@ -671,6 +867,8 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
                 log[k] = np.stack(log[k], axis=0)
 
             report_bake_quality(log, motion, robot)
+            if args_cli.show_contact_points:
+                report_contact_points(log, robot)
             if args_cli.object_physics:
                 ref_obj = np.stack(log.pop("ref_object_pos_w"))
                 sim_obj = log["object_pos_w"]
@@ -686,6 +884,211 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
             if video_writer is not None:
                 video_writer.close()
             return
+
+
+def prepend_start_transition(
+    motion: "InterMimicMotionLoader", robot, robot_joint_indexes: list[int], sim, scene, foot_ids: list[int]
+) -> tuple[int, "torch.Tensor"]:
+    """Prepend a standing-pose -> clip-first-pose lead-in; returns (frames added, feet of the clip's first frame).
+
+    The mirror of :func:`append_stand_transition`. Joints: cubic Hermite from (q_stand, 0) to the clip's first
+    (q, v), so the lead-in starts at rest and arrives with the clip's own joint velocity. Root orientation: slerp
+    (smoothstep-timed) from upright-at-the-clip's-initial-heading into the clip's first rotation. Root position is
+    a placeholder; the bake loop places it from the feet each frame, against the returned reference. The object is
+    held at its first pose and the hand contact labels are cleared.
+    """
+    fps = motion.output_fps
+    steps = max(int(round(args_cli.start_s * fps)), 1)
+    duration = steps / fps
+    dev = motion.motion_dof_poss.device
+
+    # Feet of the clip's first frame: what the lead-in has to stand on. FK it before the arrays are extended.
+    root_states = robot.data.default_root_state.clone()
+    root_states[:, :3] = motion.motion_base_poss[0]
+    root_states[:, :2] += scene.env_origins[:, :2]
+    root_states[:, 3:7] = motion.motion_base_rots[0]
+    root_states[:, 7:] = 0.0
+    robot.write_root_state_to_sim(root_states)
+    joint_pos = robot.data.default_joint_pos.clone()
+    joint_pos[:, robot_joint_indexes] = motion.motion_dof_poss[0]
+    robot.write_joint_state_to_sim(joint_pos, torch.zeros_like(joint_pos))
+    sim.physics_sim_view.update_articulations_kinematic()
+    robot.update(0.0)
+    feet_ref = robot.data.body_pos_w[0, foot_ids].clone()
+
+    q1, v1 = motion.motion_dof_poss[0], motion.motion_dof_vels[0]
+    if args_cli.start_pose == "prepare":
+        q0 = torch.tensor(K1_PREPARE_POSE, device=dev, dtype=q1.dtype)
+    else:
+        q0 = robot.data.default_joint_pos[0, robot_joint_indexes].to(dev)
+    # u = 0 .. (steps-1)/steps: the lead-in's first frame is exactly the standing pose, and frame `steps` of the
+    # output is the clip's own first frame, so u = 1 is never emitted twice.
+    u = (torch.arange(0, steps, device=dev, dtype=torch.float32) / steps).unsqueeze(-1)
+    h00, h01, h11 = 2 * u**3 - 3 * u**2 + 1, -2 * u**3 + 3 * u**2, u**3 - u**2
+    d00, d01, d11 = 6 * u**2 - 6 * u, -6 * u**2 + 6 * u, 3 * u**2 - 2 * u
+    dof_pos = h00 * q0 + h01 * q1 + h11 * duration * v1
+    dof_vel = (d00 * q0 + d01 * q1 + d11 * duration * v1) / duration
+
+    rot1 = motion.motion_base_rots[0]
+    w, x, y, z = rot1.tolist()
+    yaw = math.atan2(2 * (w * z + x * y), 1 - 2 * (y * y + z * z))
+    rot0 = torch.tensor([math.cos(yaw / 2), 0.0, 0.0, math.sin(yaw / 2)], device=dev)
+    if torch.dot(rot0, rot1) < 0:
+        rot0 = -rot0
+    s_t = 3 * u**2 - 2 * u**3
+    angle = torch.acos(torch.clamp(torch.dot(rot0, rot1), -1.0, 1.0))
+    if angle < 1e-6:
+        rots = rot0.expand(steps, 4).clone()
+    else:
+        rots = (torch.sin((1 - s_t) * angle) * rot0 + torch.sin(s_t * angle) * rot1) / torch.sin(angle)
+
+    def prepend(name: str, head: torch.Tensor):
+        cur = getattr(motion, name)
+        setattr(motion, name, torch.cat([head.to(cur.dtype), cur], dim=0))
+
+    prepend("motion_dof_poss", dof_pos)
+    prepend("motion_dof_vels", dof_vel)
+    prepend("motion_base_rots", rots)
+    prepend("motion_base_poss", motion.motion_base_poss[:1].expand(steps, 3))
+    prepend("motion_base_lin_vels", torch.zeros(steps, 3, device=dev))
+    prepend("motion_base_ang_vels", torch.zeros(steps, 3, device=dev))
+    prepend("motion_object_poss", motion.motion_object_poss[:1].expand(steps, 3))
+    prepend("motion_object_rots", motion.motion_object_rots[:1].expand(steps, 4))
+    prepend("motion_object_lin_vels", torch.zeros(steps, 3, device=dev))
+    prepend("motion_object_ang_vels", torch.zeros(steps, 3, device=dev))
+    prepend("motion_contacts", torch.zeros(steps, motion.motion_contacts.shape[1], device=dev))
+    motion.output_frames += steps
+    motion.lead_frames = steps
+    print(
+        f"[START]: prepended {steps} frames ({duration:.2f} s) from the '{args_cli.start_pose}' standing pose to the"
+        f" clip's first pose; max joint change {(q1 - q0).abs().max().item():.3f} rad, clip start joint speed"
+        f" {v1.abs().max().item():.3f} rad/s",
+        flush=True,
+    )
+    return steps, feet_ref
+
+
+def precompute_contact_targets(motion, robot, sim, scene, palm_ids, palm_offsets) -> torch.Tensor:
+    """Per-frame contact target for each hand, in the object's own frame: (frames, 2, 3).
+
+    This is the quantity the HOI observation carries. While the reference reports contact it is the live palm
+    keypoint expressed in the object frame. While it does not, it holds the value the palm will have at the
+    *start of the next* contact window, so the target is an aim point the hand can converge on during the
+    approach; after the final window it holds that window's last value.
+
+    Needs a forward-kinematics pass over the whole clip, which the main loop cannot do because it only ever
+    sees one frame at a time. No physics is stepped and nothing is rendered, so the pass is cheap.
+    """
+    n = motion.output_frames
+    dev = sim.device
+    palms = torch.zeros(n, len(palm_ids), 3, device=dev)
+    joint_pos_full = robot.data.default_joint_pos.clone()
+    robot_joint_indexes = resolve_joint_indexes(list(robot.joint_names), K1_DOF_ALIASES)
+    for f in range(n):
+        root_states = robot.data.default_root_state.clone()
+        root_states[:, :3] = motion.motion_base_poss[f]
+        root_states[:, :2] += scene.env_origins[:, :2]
+        root_states[:, 3:7] = motion.motion_base_rots[f]
+        root_states[:, 7:] = 0.0
+        robot.write_root_state_to_sim(root_states)
+        joint_pos = joint_pos_full.clone()
+        joint_pos[:, robot_joint_indexes] = motion.motion_dof_poss[f]
+        robot.write_joint_state_to_sim(joint_pos, torch.zeros_like(joint_pos))
+        sim.physics_sim_view.update_articulations_kinematic()
+        robot.update(0.0)
+        palms[f] = robot.data.body_pos_w[0, palm_ids] + quat_apply(robot.data.body_quat_w[0, palm_ids], palm_offsets)
+
+    # Into the reference object's frame. Both sides carry the env origin, so it cancels; subtract it anyway.
+    obj_pos = motion.motion_object_poss + scene.env_origins[0]
+    obj_quat = motion.motion_object_rots
+    rel = palms - obj_pos[:, None, :]
+    conj = quat_conjugate(obj_quat)[:, None, :].expand(-1, palms.shape[1], -1)
+    local = quat_apply(conj, rel)
+
+    contact = motion.motion_contacts > 0.5
+    target = local.clone()
+    for side in range(palms.shape[1]):
+        frames = torch.nonzero(contact[:, side]).flatten()
+        if frames.numel() == 0:
+            print(f"[TARGET]: hand {side} never contacts; its target is the live palm point.", flush=True)
+            continue
+        # First frame of each contact run, and the last frame of the final run.
+        starts = frames[torch.cat([torch.ones(1, dtype=torch.bool, device=dev), frames[1:] != frames[:-1] + 1])]
+        for f in range(n):
+            if contact[f, side]:
+                continue
+            ahead = starts[starts > f]
+            target[f, side] = local[ahead[0] if ahead.numel() else frames[-1], side]
+        runs = starts.numel()
+        step = (target[1:, side] - target[:-1, side]).norm(dim=-1)
+        worst = int(step.argmax())
+        print(
+            f"[TARGET]: hand {side}: {frames.numel()} contact frames in {runs} window(s);"
+            f" target held from the next window on {int((~contact[:, side]).sum())} frames;"
+            f" largest frame-to-frame jump {step.max().item() * 100:.1f} cm at frame {worst}",
+            flush=True,
+        )
+    return target
+
+
+def append_stand_transition(motion: "InterMimicMotionLoader", robot, robot_joint_indexes: list[int]) -> int:
+    """Extend the loaded motion with a last-pose -> default-standing-pose transition; returns its first frame.
+
+    Joints: cubic Hermite from (q_end, v_end) to (q_stand, 0) over the transition, so the joint velocity is continuous
+    with the clip and the transition ends at rest. Root orientation: slerp (smoothstep-timed) to upright with the clip's
+    final heading. Root position is a placeholder here; the bake loop places it from the feet each frame. The object
+    is held at its final pose and the hand contact labels are cleared.
+    """
+    fps = motion.output_fps
+    n = motion.output_frames
+    steps = max(int(round(args_cli.stand_s * fps)), 1)
+    duration = steps / fps
+    dev = motion.motion_dof_poss.device
+    q0, v0 = motion.motion_dof_poss[-1], motion.motion_dof_vels[-1]
+    if args_cli.stand_pose == "prepare":
+        q1 = torch.tensor(K1_PREPARE_POSE, device=dev, dtype=q0.dtype)
+    else:
+        q1 = robot.data.default_joint_pos[0, robot_joint_indexes].to(dev)
+    u = (torch.arange(1, steps + 1, device=dev, dtype=torch.float32) / steps).unsqueeze(-1)
+    h00, h10, h01 = 2 * u**3 - 3 * u**2 + 1, u**3 - 2 * u**2 + u, -2 * u**3 + 3 * u**2
+    d00, d10, d01 = 6 * u**2 - 6 * u, 3 * u**2 - 4 * u + 1, -6 * u**2 + 6 * u
+    dof_pos = h00 * q0 + h10 * duration * v0 + h01 * q1
+    dof_vel = (d00 * q0 + d10 * duration * v0 + d01 * q1) / duration
+
+    rot0 = motion.motion_base_rots[-1]
+    w, x, y, z = rot0.tolist()
+    yaw = math.atan2(2 * (w * z + x * y), 1 - 2 * (y * y + z * z))
+    rot1 = torch.tensor([math.cos(yaw / 2), 0.0, 0.0, math.sin(yaw / 2)], device=dev)
+    if torch.dot(rot0, rot1) < 0:
+        rot1 = -rot1
+    s = 3 * u**2 - 2 * u**3
+    angle = torch.acos(torch.clamp(torch.dot(rot0, rot1), -1.0, 1.0))
+    if angle < 1e-6:
+        rots = rot0.expand(steps, 4).clone()
+    else:
+        rots = (torch.sin((1 - s) * angle) * rot0 + torch.sin(s * angle) * rot1) / torch.sin(angle)
+
+    def extend(name: str, tail: torch.Tensor):
+        setattr(motion, name, torch.cat([getattr(motion, name), tail.to(getattr(motion, name).dtype)], dim=0))
+
+    extend("motion_dof_poss", dof_pos)
+    extend("motion_dof_vels", dof_vel)
+    extend("motion_base_rots", rots)
+    extend("motion_base_poss", motion.motion_base_poss[-1:].expand(steps, 3))
+    extend("motion_base_lin_vels", torch.zeros(steps, 3, device=dev))
+    extend("motion_base_ang_vels", torch.zeros(steps, 3, device=dev))
+    extend("motion_object_poss", motion.motion_object_poss[-1:].expand(steps, 3))
+    extend("motion_object_rots", motion.motion_object_rots[-1:].expand(steps, 4))
+    extend("motion_object_lin_vels", torch.zeros(steps, 3, device=dev))
+    extend("motion_object_ang_vels", torch.zeros(steps, 3, device=dev))
+    extend("motion_contacts", torch.zeros(steps, motion.motion_contacts.shape[1], device=dev))
+    motion.output_frames = n + steps
+    print(
+        f"[STAND]: appended {steps} frames ({duration:.2f} s) from the last pose to the '{args_cli.stand_pose}' standing pose;"
+        f" max joint change {(q1 - q0).abs().max().item():.3f} rad, clip end joint speed {v0.abs().max().item():.3f} rad/s",
+        flush=True,
+    )
+    return n
 
 
 def setup_object_physics(obj: RigidObject, scene: InteractiveScene, motion: "InterMimicMotionLoader"):
@@ -732,15 +1135,123 @@ def setup_object_physics(obj: RigidObject, scene: InteractiveScene, motion: "Int
     )
 
 
+def _quat_apply_np(quat: np.ndarray, vec: np.ndarray) -> np.ndarray:
+    """Rotate vectors (..., 3) by wxyz quaternions (..., 4)."""
+    w, xyz = quat[..., :1], quat[..., 1:]
+    t = 2.0 * np.cross(xyz, vec)
+    return vec + w * t + np.cross(xyz, t)
+
+
+def cli_palm_offset() -> float | np.ndarray:
+    """``--palm_offset`` as either a scalar (y-only) or the left hand's (3,) offset vector."""
+    values = args_cli.palm_offset
+    if len(values) == 1:
+        return float(values[0])
+    if len(values) == 3:
+        return np.asarray(values, dtype=float)
+    raise SystemExit(f"--palm_offset takes 1 or 3 values, got {len(values)}")
+
+
+def palm_offset_vectors(offset) -> np.ndarray:
+    """(2, 3) per-hand keypoint offsets.
+
+    A scalar is the y-only convention. A (3,) vector is the left hand's offset and the right hand mirrors it in
+    y. A (2, 3) array is used as given, which is how the per-hand fitted offsets are checked.
+    """
+    array = np.asarray(offset, dtype=float)
+    if array.ndim == 0:
+        return np.array([[0.0, sign * float(array), 0.0] for sign in PALM_SIGNS])
+    if array.shape == (3,):
+        return np.stack([array, array * np.array([1.0, -1.0, 1.0])])
+    return array.reshape(2, 3)
+
+
+def palm_positions_np(log: dict, robot, offset: float | np.ndarray) -> np.ndarray:
+    """World palm keypoints (T, 2, 3) from the logged link poses and the per-hand local offsets."""
+    ids = [robot.body_names.index(name) for name in PALM_BODY_NAMES]
+    pos, quat = log["body_pos_w"][:, ids], log["body_quat_w"][:, ids]
+    local = palm_offset_vectors(offset).astype(pos.dtype)
+    return pos + _quat_apply_np(quat, np.broadcast_to(local, pos.shape))
+
+
+def palm_to_object_distance(log: dict, robot, offset: float | np.ndarray, mesh, frames: np.ndarray, side: int) -> np.ndarray:
+    """Distance from the palm keypoint to the object surface, on the given frames of one hand."""
+    import trimesh
+
+    palm = palm_positions_np(log, robot, offset)[frames, side]
+    obj_pos, obj_quat = log["object_pos_w"][frames], log["object_quat_w"][frames]
+    conj = obj_quat * np.array([1.0, -1.0, -1.0, -1.0], dtype=obj_quat.dtype)
+    local = _quat_apply_np(conj, palm - obj_pos)  # into the object frame, where the mesh lives
+    return trimesh.proximity.closest_point(mesh, local)[1]
+
+
+def contact_points_object_frame(log: dict, robot, offset, frames: np.ndarray, side: int) -> np.ndarray:
+    """Palm keypoint expressed in the object's own frame, on the given frames of one hand: (F, 3).
+
+    This is exactly the quantity the HOI observation is built from -- no projection onto the mesh. Its spread
+    over the contact window says whether the capture holds the object at a repeatable place on the palm.
+    """
+    palm = palm_positions_np(log, robot, offset)[frames, side]
+    obj_pos, obj_quat = log["object_pos_w"][frames], log["object_quat_w"][frames]
+    flip = np.array([1.0, -1.0, -1.0, -1.0], dtype=obj_quat.dtype)
+    return _quat_apply_np(obj_quat * flip, palm - obj_pos)
+
+
+def report_contact_points(log: dict, robot):
+    """Check the palm keypoints against the object over the reference's labelled contact frames.
+
+    The contact point the HOI observations are built from is the palm position expressed in the object frame, so
+    it is only meaningful if the palm keypoint actually lands on the object when the capture says it should.
+    This prints that distance, and scans --palm_offset to show which offset the capture itself implies.
+    """
+    import trimesh
+
+    contact = log["contact"] > 0.5
+    print("[CONTACT]: ---- palm keypoints vs object ----")
+    if not contact.any():
+        print("[CONTACT]: the clip labels no contact frames; nothing to check.")
+        return
+    if not os.path.isfile(OBJECT_MESH):
+        print(f"[CONTACT]: no mesh at {OBJECT_MESH}; skipping the surface check.")
+        return
+    mesh = trimesh.load(OBJECT_MESH, force="mesh")
+    print(f"[CONTACT]: mesh {os.path.basename(OBJECT_MESH)}, watertight={mesh.is_watertight}, extents="
+          f"{np.round(mesh.extents, 3).tolist()} m")
+
+    for side, name in enumerate(PALM_BODY_NAMES):
+        frames = np.flatnonzero(contact[:, side])
+        if frames.size == 0:
+            print(f"[CONTACT]: {name}: no labelled contact frames")
+            continue
+        sampled = frames[:: max(1, frames.size // 200)]  # bound the proximity queries
+        gap = palm_to_object_distance(log, robot, cli_palm_offset(), mesh, sampled, side)
+        point = contact_points_object_frame(log, robot, cli_palm_offset(), sampled, side)
+        print(
+            f"[CONTACT]: {name}: {frames.size} contact frames ({frames.size / len(contact) * 100:.0f}% of clip)\n"
+            f"[CONTACT]:   contact point in object frame: {np.round(point.mean(axis=0), 3).tolist()} m"
+            f"  +/- {np.round(point.std(axis=0), 3).tolist()}\n"
+            f"[CONTACT]:   drift over the window        : {np.round(point.max(axis=0) - point.min(axis=0), 3).tolist()} m\n"
+            f"[CONTACT]:   palm to object surface       : mean {gap.mean() * 100:.1f} cm,"
+            f" min {gap.min() * 100:.1f}, max {gap.max() * 100:.1f}"
+        )
+    print("[CONTACT]: the contact point is the palm keypoint in the object frame as-is -- it is not projected onto"
+          " the mesh, so a few cm of surface gap is expected and fine. What matters is the spread: a tight one"
+          " means the capture holds the object at a repeatable place, which is what makes the point learnable.")
+
+
 def report_bake_quality(log: dict, motion: InterMimicMotionLoader, robot):
     """Cross-checks the regenerated bodies against the source file."""
     root_body_index = 0
-    src_root_pos = motion.motion_base_poss.cpu().numpy()
-    baked_root_pos = log["body_pos_w"][:, root_body_index]
+    # Only the source frames round-trip; --start_s / --stand_s transitions around them are synthesized.
+    n_src = motion.source_body_lin_vels.shape[0]
+    lead = getattr(motion, "lead_frames", 0)
+    clip = slice(lead, lead + n_src)
+    src_root_pos = motion.motion_base_poss[clip].cpu().numpy()
+    baked_root_pos = log["body_pos_w"][clip, root_body_index]
     pos_err = np.abs(baked_root_pos - src_root_pos).max()
 
     src_root_vel = motion.source_body_lin_vels[:, root_body_index].cpu().numpy()
-    baked_root_vel = log["body_lin_vel_w"][:, root_body_index]
+    baked_root_vel = log["body_lin_vel_w"][clip, root_body_index]
     vel_err = np.abs(baked_root_vel - src_root_vel).max()
 
     min_z = log["body_pos_w"][..., 2].min()
@@ -750,6 +1261,28 @@ def report_bake_quality(log: dict, motion: InterMimicMotionLoader, robot):
     obj_max_z = log["object_pos_w"][..., 2].max()
 
     print("[CHECK]: ---- bake quality ----")
+    feet = [robot.body_names.index(name) for name in ("left_foot_link", "right_foot_link")]
+    if lead:
+        head = log["body_pos_w"][: lead + 1, feet]  # lead-in + the clip's first frame
+        slide = np.linalg.norm(head[:, :, :2] - head[-1:, :, :2], axis=-1).max(axis=0)
+        rise = (head[:, :, 2] - head[-1:, :, 2]).max(axis=0)
+        jv = log["joint_vel"][lead - 1 : lead + 1]
+        print(f"[CHECK]: lead-in frames                  : {lead}")
+        print(f"[CHECK]: lead foot slide L/R (max, xy)   : {slide[0]:.3f} / {slide[1]:.3f} m")
+        print(f"[CHECK]: lead foot rise L/R (max, z)     : {rise[0]:.3f} / {rise[1]:.3f} m")
+        print(f"[CHECK]: lead root height start          : {log['body_pos_w'][0, 0, 2]:.3f} m (clip start {log['body_pos_w'][lead, 0, 2]:.3f})")
+        print(f"[CHECK]: joint vel step at lead->clip    : {np.abs(jv[1] - jv[0]).max():.3f} rad/s")
+    if log["body_pos_w"].shape[0] > lead + n_src:
+        stand0 = lead + n_src  # index of the first stand-transition frame
+        tail = log["body_pos_w"][stand0 - 1 :, feet]  # last clip frame + transition
+        slide = np.linalg.norm(tail[:, :, :2] - tail[:1, :, :2], axis=-1).max(axis=0)
+        lift = (tail[:, :, 2] - tail[:1, :, 2]).max(axis=0)
+        jv = log["joint_vel"][stand0 - 1 : stand0 + 1]
+        print(f"[CHECK]: stand transition frames         : {log['body_pos_w'].shape[0] - stand0}")
+        print(f"[CHECK]: stand foot slide L/R (max, xy)  : {slide[0]:.3f} / {slide[1]:.3f} m")
+        print(f"[CHECK]: stand foot rise L/R (max, z)    : {lift[0]:.3f} / {lift[1]:.3f} m")
+        print(f"[CHECK]: stand root height end           : {log['body_pos_w'][-1, 0, 2]:.3f} m (clip end {log['body_pos_w'][stand0 - 1, 0, 2]:.3f})")
+        print(f"[CHECK]: joint vel step at clip->stand   : {np.abs(jv[1] - jv[0]).max():.3f} rad/s")
     print(f"[CHECK]: frames baked                    : {log['body_pos_w'].shape[0]}")
     print(f"[CHECK]: root pos round-trip (max abs)   : {pos_err:.6f} m   (expect ~0)")
     print(f"[CHECK]: root lin vel round-trip (max abs): {vel_err:.6f} m/s (expect ~0)")
