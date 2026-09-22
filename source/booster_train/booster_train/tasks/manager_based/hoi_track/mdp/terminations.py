@@ -168,19 +168,25 @@ class LostContact(ManagerTermBase):
     Per hand :math:`i`, with :math:`c_i` the reference contact label:
 
     .. math::
-        \text{lost}_i = c_i \land (F_{n,i} < F_{lost}) \land (\|p_{palm,i} - p_{target,i}\| > d_{lost})
+        \text{lost}_i = c_i \land \big((F_{n,i} < F_{lost}) \lor (\|p_{palm,i} - p_{target,i}\| > d_{lost})\big)
+
+    Either condition alone is enough, matching HDMI's ``cum_lost_contact_steps``, which builds
+    ``in_contact = contact_pos & contact_frc`` and fires on its negation. A hand parked on the contact point
+    without pressing, or pressing somewhere other than the contact point, both count as lost.
 
     Each hand carries its own consecutive-step counter, zeroed on the falling edge of its own condition --
     including when :math:`c_i` drops to 0 between grasp windows -- and either hand exceeding ``max_steps`` ends
     the episode. Because the reset is per hand, hands alternating between lost and regained never accumulate,
-    and a clip with several short windows never carries a count from one window into the next.
+    and a clip with several short windows never carries a count from one window into the next. This is a
+    deliberate divergence: HDMI keeps one counter fed by ``.any(dim=-1)``, which does accumulate across hands.
 
     Despite the name this tests "not in contact although the reference says it should be", whether or not
     contact was ever established in the first place.
 
-    The thresholds are deliberately looser than the reward's: 2 N defines a successful grip there, 1 N and
-    0.2 m define failure here, and the gap between them is a deadband where a hand is neither paid in full nor
-    killed.
+    The 1.0 N / 0.2 m / 25-step thresholds are HDMI's (``hdmi-base.yaml:269``). The force bound stays well
+    below the reward's grip threshold, so the gap between them is a deadband where a hand is neither paid in
+    full nor killed -- but note that under the disjunction the distance bound now kills independently of
+    force, so that deadband no longer covers a hand that is simply in the wrong place.
     """
 
     def __init__(self, cfg: TerminationTermCfg, env: ManagerBasedRLEnv):
@@ -206,8 +212,8 @@ class LostContact(ManagerTermBase):
         target = command.robot_object_pos_w[:, None, :] + math_utils.quat_apply(quat, local)
         dist = torch.norm(command.robot_palm_pos_w - target, dim=-1)  # (N, P)
 
-        force = hand_object_normal_force(env, contact_sensor_names, reduce="mean")
-        lost = (command.ref_contact > 0.5) & (force < force_threshold) & (dist > distance_threshold)
+        force = hand_object_normal_force(env, contact_sensor_names, reduce="last")
+        lost = (command.ref_contact > 0.5) & ((force < force_threshold) | (dist > distance_threshold))
 
         self.lost_steps = torch.where(lost, self.lost_steps + 1, torch.zeros_like(self.lost_steps))
         return (self.lost_steps > max_steps).any(dim=-1)

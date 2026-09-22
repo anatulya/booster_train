@@ -328,6 +328,10 @@ class MotionCommand(CommandTerm):
         return self.object.data.root_quat_w
 
     @property
+    def robot_object_lin_vel_w(self) -> torch.Tensor:
+        return self.object.data.root_lin_vel_w
+
+    @property
     def body_lin_vel_w(self) -> torch.Tensor:
         return self.motion.body_lin_vel_w[self.time_steps]
 

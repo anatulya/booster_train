@@ -125,29 +125,19 @@ def feet_stance_time(
 
 
 def hand_object_normal_force(
-    env: ManagerBasedRLEnv, contact_sensor_names: list[str], reduce: str = "last"
+    env: ManagerBasedRLEnv, contact_sensor_names: list[str], reduce: str = "mean"
 ) -> torch.Tensor:
     """Normal contact force per hand against the filtered object, (N, len(contact_sensor_names)).
 
     ``force_matrix_w`` is already the *normal* force -- PhysX reports friction separately, in the
     ``friction_forces_w`` field -- so this is F_n directly, with no surface-normal approximation.
 
-    One sensor per hand, because PhysX filtered contact reporting is one body to many targets. The sensor
-    covers the *whole* body: ``get_contact_force_matrix`` returns one vector per ``(body, filter)`` pair,
-    summing every contact point on the link, and ``*_hand_link`` has exactly one ``<collision>``. That link
-    hangs off ``*_Elbow_Yaw`` and its mesh (``*_Arm_4.STL``) runs 0.258 m -- the full forearm plus hand stub,
-    with the palm keypoint offset ~0.2 m out to its tip. So a single sensor here is the equivalent of HDMI
-    summing force vectors across the several links its G1 end-effector spans.
+    Each sensor must cover a single body filtered against a single target, because PhysX filtered contact
+    reporting is one-to-many, so each hand needs its own sensor. ``reduce`` picks how the physics substeps of
+    one control step are collapsed:
 
-    ``reduce`` picks how the physics substeps of one control step are collapsed. ``scene.update()`` runs
-    inside the decimation loop, so the history holds one entry per substep, newest first:
-
-    - ``"last"`` for the reward and termination: ``history[:, 0]`` is written from ``force_matrix_w``, so this
-      is exactly the quantity HDMI thresholds. The two reducers share a mean; what differs is variance, and a
-      threshold well above the typical force is sensitive to precisely that -- averaging suppresses the peaks
-      that would cross it.
-    - ``"mean"`` averages the whole control step. Lower variance and arguably the better summary, since PhysX
-      already reports impulse/dt per substep, but it is not what the HDMI constants were tuned against.
+    - ``"mean"`` for the reward: a hand touching for one substep out of four should not read as a full step of
+      contact, which is exactly the graze-versus-grip distinction the interaction reward exists to draw.
     - ``"peak"`` for a presence flag, where catching a brief touch is the point.
     """
     out = []
@@ -157,12 +147,7 @@ def hand_object_normal_force(
             f"Contact sensor '{name}' needs history_length >= decimation ({env.cfg.decimation})."
         )
         magnitude = torch.norm(history[:, : env.cfg.decimation, 0, 0], dim=-1)  # (N, decimation)
-        if reduce == "last":
-            out.append(magnitude[:, 0])
-        elif reduce == "mean":
-            out.append(magnitude.mean(dim=1))
-        else:
-            out.append(magnitude.amax(dim=1))
+        out.append(magnitude.mean(dim=1) if reduce == "mean" else magnitude.amax(dim=1))
     return torch.stack(out, dim=1)
 
 
@@ -193,22 +178,6 @@ def motion_global_object_orientation_error_exp(
     return torch.exp(-error / std**2)
 
 
-def motion_global_object_linear_velocity_error_exp(
-    env: ManagerBasedRLEnv, command_name: str, std: float | str
-) -> torch.Tensor:
-    """World-frame object linear velocity tracking; the object mirror of the per-body velocity term.
-
-    The reference box is stationary for most of a clip (median speed 0.006 m/s over ``sub1_suitcase_029``,
-    p90 0.43, peak 1.7), so this is near-free outside the lift and only bites while the box is actually
-    moving. That asymmetry is the point: it shapes *how* the box is carried rather than adding a constant
-    offset, and a dropped box reaching 1-2 m/s in free fall scores essentially zero.
-    """
-    command: MotionCommand = env.command_manager.get_term(command_name)
-    error = torch.sum(torch.square(command.object_lin_vel_w - command.robot_object_lin_vel_w), dim=-1)
-    std = _get_adaptive_sigma(env, std, error.mean())
-    return torch.exp(-error / std**2)
-
-
 class HandObjectInteraction(ManagerTermBase):
     r"""Pays a hand for being on its contact point *and* pressing on the object.
 
@@ -217,33 +186,24 @@ class HandObjectInteraction(ManagerTermBase):
     .. math::
         r_{int,i} &= \exp(-d_i / \sigma_p),\quad d_i = \|p_{palm,i} - p_{target,i}\| \\
         r_{F,i}   &= \exp(\min(F_{n,i} - F_{thr}, 0) / \sigma_F) \\
-        r_i       &= c_i\,g\,(r_{int,i}\,r_{F,i}) + (1 - c_i)
+        r_i       &= c_i\,(r_{int,i}\,r_{F,i}) + (1 - c_i)
 
-    and the reward is the mean over hands. The formulation and every default is HDMI's ``eef_contact_exp``
-    (``cfg/task/base/hdmi-base.yaml:220``).
+    and the reward is the mean over hands.
 
     The target rides the *actual* object: it is the reference contact point carried onto wherever the object
     currently is, so if the object gets knocked out of place the target follows it instead of pointing at where
     the reference expected it to be.
 
     ``r_F`` saturates at 1.0 once the force reaches ``force_threshold``, so that threshold stays the definition
-    of a successful grip, but it decays smoothly below rather than switching off -- a hand at zero force still
-    scores ``exp(-10/40) = 0.779``. That matters: with a hard indicator, ``r_int`` would be multiplied by zero
-    for the entire approach and the position term could never teach the hand to close the last few centimetres.
-    At these widths ``r_F`` spans only 0.779 to 1.0, so force is a nudge and position does the shaping;
-    :class:`~.terminations.LostContact` is what actually enforces contact.
+    of a successful grip, but it decays smoothly below rather than switching off. That matters: with a hard
+    indicator, ``r_int`` would be multiplied by zero for the entire approach and the position term could never
+    teach the hand to close the last few centimetres.
 
     Where the reference reports no contact the term is treated as already satisfied and contributes 1, so it
-    applies no pressure outside the grasp windows. ``gain`` is what makes that survivable as a design: without
-    it, a single weight sets both the grasping gradient (``weight * gain``, on gated hands) and that flat
-    constant (``weight``, everywhere else), and the constant dominates -- measured at 25k iterations, 9.24 of
-    the 10.05 earned was the constant and only 0.83 was grasping. ``gain`` scales only the part the policy can
-    move.
-
-    ``Interaction/*`` logs the *un-gained* sub-terms, so those curves stay comparable across a gain change.
+    applies no pressure outside the grasp windows.
     """
 
-    TERMS = ("r_int", "r_F", "dist", "contact_frac", "force")
+    TERMS = ("r_int", "r_F", "dist", "contact_frac")
 
     def __init__(self, cfg: RewardTermCfg, env: ManagerBasedRLEnv):
         super().__init__(cfg, env)
@@ -276,10 +236,9 @@ class HandObjectInteraction(ManagerTermBase):
         env: ManagerBasedRLEnv,
         command_name: str,
         contact_sensor_names: list[str],
-        sigma_p: float = 0.3,
-        sigma_f: float = 40.0,
-        force_threshold: float = 10.0,
-        gain: float = 5.0,
+        sigma_p: float = 0.1,
+        sigma_f: float = 1.0,
+        force_threshold: float = 2.0,
     ) -> torch.Tensor:
         command: MotionCommand = env.command_manager.get_term(command_name)
 
@@ -288,22 +247,19 @@ class HandObjectInteraction(ManagerTermBase):
         target = command.robot_object_pos_w[:, None, :] + quat_apply(quat, local)
         dist = torch.norm(command.robot_palm_pos_w - target, dim=-1)  # (N, P); a norm, so frame-free
 
-        force = hand_object_normal_force(env, contact_sensor_names, reduce="last")
+        force = hand_object_normal_force(env, contact_sensor_names, reduce="mean")
         r_int = torch.exp(-dist / sigma_p)
         r_f = torch.exp(torch.clamp(force - force_threshold, max=0.0) / sigma_f)
 
         gate = command.ref_contact  # (N, P), 0/1 from the capture
-        reward = (gate * (r_int * r_f) * gain + (1.0 - gate)).mean(dim=-1)
+        reward = (gate * (r_int * r_f) + (1.0 - gate)).mean(dim=-1)
 
-        # Episode means over the frames the gate is actually open. Deliberately un-gained, so a gain change
-        # does not move these curves: they report behaviour, not the reward's scale. ``force`` is in Newtons,
-        # which makes it the one sub-term comparable across a ``force_threshold`` change too.
+        # Episode means over the frames the gate is actually open.
         active = gate.sum(dim=-1)
         weighted = lambda value: (value * gate).sum(dim=-1)  # noqa: E731
         self.sums["r_int"] += weighted(r_int)
         self.sums["r_F"] += weighted(r_f)
         self.sums["dist"] += weighted(dist)
         self.sums["contact_frac"] += weighted((force > force_threshold).float())
-        self.sums["force"] += weighted(force)
         self.counts += active
         return reward

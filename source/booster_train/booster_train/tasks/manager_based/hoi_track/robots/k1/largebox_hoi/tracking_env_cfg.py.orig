@@ -32,34 +32,15 @@ import booster_train.tasks.manager_based.hoi_track.mdp as mdp
 OBJECT_CONTACT_FILTER = "{ENV_REGEX_NS}/Object/largebox_0539923_link"
 HAND_CONTACT_SENSOR_NAMES = ["left_hand_object_contact", "right_hand_object_contact"]
 HAND_CONTACT_FORCE_THRESHOLD = 0.1
-# Reward-side contact, taken verbatim from HDMI's eef_contact_exp (cfg/task/base/hdmi-base.yaml:220). Their
-# direct analogue to this task -- cfg/task/G1/hdmi/move_suitcase.yaml, same OMOMO dataset, sub1_suitcase_011
-# against our sub1_suitcase_029 -- inherits these unchanged.
-#
-# These are not per-object numbers. frc_thres=10 is a single global constant in HDMI, applied across objects
-# from 0.9 kg to 40 kg; the only task-level override repeats it, and the one config with different values is
-# commented out. It is better read as a robot-scale quantity -- achievable normal force comes from how hard
-# the arm squeezes and how stiff the contact is, not from the object's weight -- so it is a fact about the G1
-# rather than something portable to the K1 by arithmetic. Whether the K1 can reach 10 N here is an open
-# question; Interaction/force logs it in Newtons so the answer shows up in the first few hundred iterations.
-#
-# The previous 0.1 / 1.0 pair made this a near-gate rather than a shaped reward: a hand at zero force scored
-# exp(-2/1) = 0.135, and at the 25k run's measured 0.158 m gated palm distance r_int scored 0.400. Their
-# product left almost no gradient during the approach, which is the phase that needs it most. At 10/40 the
-# force factor instead spans only 0.779 to 1.0, so force nudges and position shapes.
-CONTACT_REWARD_FORCE_THRESHOLD = 10.0
-CONTACT_SIGMA_P = 0.3
-CONTACT_SIGMA_F = 40.0
-# Scales only the gated part of the interaction reward. Without it a single weight sets both the grasping
-# gradient and the flat (1 - gate) survival constant, and the constant wins: at 25k iterations 9.24 of the
-# 10.05 earned was the constant and 0.83 was grasping. At gain 5 the gated-frame weight becomes 100 against
-# 139 for all body tracking combined -- close to HDMI, which runs grasping at 1:1 with its tracking group.
-CONTACT_GAIN = 5.0
+# Reward-side contact. 2 N is the definition of a grip, as opposed to the 0.1 N presence flag the observation
+# uses; sigma_f shapes the approach to it, so a hand at zero force still scores exp(-2/1) = 0.135 rather than 0
+# and the position term keeps a live gradient before contact ever happens.
+CONTACT_REWARD_FORCE_THRESHOLD = 2.0
+CONTACT_SIGMA_P = 0.1
+CONTACT_SIGMA_F = 1.0
 
-# Early termination. LOST_CONTACT_* are HDMI's cum_lost_contact_steps values (hdmi-base.yaml:269), and the
-# force bound stays far below the reward's grip threshold on purpose: between 1 N and CONTACT_REWARD_FORCE_-
-# THRESHOLD is a deadband where a hand is neither paid in full nor killed. LostContact now fires on either
-# condition rather than both, so that deadband no longer shelters a hand that is simply in the wrong place.
+# Early termination. Looser than the reward's 2 N grip threshold on purpose: the gap between 1 N (failure) and
+# 2 N (success) is a deadband where a hand is neither paid in full nor killed.
 #
 # OBJECT_POS_TERMINATION is measured in the robot's heading frame (see BadObjectPos), not in world, so it is
 # a budget for "the box is misplaced relative to me" and not for global drift. The world-frame version of this
@@ -106,36 +87,13 @@ REFERENCE_TERM_FUNCS = (
     "ref_contact_flag",
 )
 
-# Reset jitter only: added to the reference root velocity when an env is placed on its start frame, in
-# MotionCommand._resample_command.
-#
-# Softened to match PUSH_VELOCITY_RANGE below. The old +-0.7/0.7/0.4 m/s was wildly out of scale with the clip:
-# the reference Trunk moves at 0.071 m/s median and 0.409 m/s at its fastest, so a max jitter magnitude of
-# 1.07 m/s spawned envs travelling 2.6x faster than anything the motion ever does, and ~15x the median. That is
-# not initial-state diversity, it is noise unrelated to the task.
-#
-# Kept as its own constant rather than aliased to the push range: the two happen to coincide now, but they
-# answer different questions (how varied a start, versus how hard a shove) and should stay independently
-# tunable.
 VELOCITY_RANGE = {
-    "x": (-0.3, 0.3),
-    "y": (-0.3, 0.3),
-    "z": (-0.05, 0.05),
-    "roll": (-0.2, 0.2),
-    "pitch": (-0.2, 0.2),
-    "yaw": (-0.3, 0.3),
-}
-
-# Push disturbance. Max magnitude 0.43 m/s and 0.41 rad/s, against 1.07 and 1.34 under the old range -- 2.5x
-# smaller linearly, 3.2x angularly, with the vertical kick 8x smaller. The old range was breaking grasps rather
-# than teaching recovery.
-PUSH_VELOCITY_RANGE = {
-    "x": (-0.3, 0.3),
-    "y": (-0.3, 0.3),
-    "z": (-0.05, 0.05),
-    "roll": (-0.2, 0.2),
-    "pitch": (-0.2, 0.2),
-    "yaw": (-0.3, 0.3),
+    "x": (-0.7, 0.7),
+    "y": (-0.7, 0.7),
+    "z": (-0.4, 0.4),
+    "roll": (-0.7, 0.7),
+    "pitch": (-0.7, 0.7),
+    "yaw": (-0.9, 0.9),
 }
 
 
@@ -323,19 +281,11 @@ class EventCfg:
     )
 
     # interval
-    #
-    # Additive, despite the name: Isaac Lab's docstring says it "sets the root velocity to a random value", but
-    # events.py:1069 does ``vel_w += sample_uniform(...)``, so the sample lands on top of whatever the trunk is
-    # already doing rather than replacing it. A push therefore perturbs momentum instead of erasing it.
-    #
-    # EventManager resamples each env's timer at reset and again after each push, so the first push arrives 3-6 s
-    # in and an episode ending before 3 s is never pushed at all. A full 10 s episode now sees ~1.8 pushes against
-    # ~4.5 under (1.0, 3.0).
     push_robot = EventTerm(
         func=mdp.push_by_setting_velocity,
         mode="interval",
-        interval_range_s=(3.0, 6.0),
-        params={"velocity_range": PUSH_VELOCITY_RANGE},
+        interval_range_s=(1.0, 3.0),
+        params={"velocity_range": VELOCITY_RANGE},
     )
 
 
@@ -353,28 +303,24 @@ class RewardsCfg:
         weight=5.0,
         params={"command_name": "motion", "std": 0.4},
     )
-    # The four motion_body_* terms average over all 14 tracked bodies. Position std is 0.15, not 0.3: at 0.3 the
-    # 25k run's 4.7 cm mean body error left this term at kernel ~0.98, almost flat across the errors the policy
-    # actually makes, so a weight of 20 would have bought a constant. At 0.15 it sits near 0.87, the operating
-    # point the dedicated hand and foot terms already have, and is about four times as sensitive to error.
     motion_body_pos = RewTerm(
         func=mdp.motion_relative_body_position_error_exp,
-        weight=20.0,
-        params={"command_name": "motion", "std": 0.15},
+        weight=1.0,
+        params={"command_name": "motion", "std": 0.3},
     )
     motion_body_ori = RewTerm(
         func=mdp.motion_relative_body_orientation_error_exp,
-        weight=15.0,
+        weight=1.0,
         params={"command_name": "motion", "std": 0.4},
     )
     motion_body_lin_vel = RewTerm(
         func=mdp.motion_global_body_linear_velocity_error_exp,
-        weight=2.5,
+        weight=1.0,
         params={"command_name": "motion", "std": 1.0},
     )
     motion_body_ang_vel = RewTerm(
         func=mdp.motion_global_body_angular_velocity_error_exp,
-        weight=2.5,
+        weight=1.0,
         params={"command_name": "motion", "std": 3.14},
     )
     action_rate_l2 = RewTerm(func=mdp.action_rate_l2, weight=-4.0)
@@ -396,13 +342,13 @@ class RewardsCfg:
 
     motion_foot_pos = RewTerm(
         func=mdp.motion_relative_body_position_error_exp,
-        weight=15.0,
+        weight=30.0,
         params={"command_name": "motion", "std": 0.2, "body_names": ["left_foot_link", "right_foot_link"]},
     )
 
     motion_hand_ori = RewTerm(
         func=mdp.motion_relative_body_orientation_error_exp,
-        weight=15.0,
+        weight=10.0,
         params={"command_name": "motion", "std": 0.2, "body_names": ["left_hand_link", "right_hand_link"]},
     )
 
@@ -418,12 +364,11 @@ class RewardsCfg:
         params={"command_name": "motion", "std": 0.2, "body_names": ["Trunk"]},
     )
 
-    # Off. The trunk is the anchor body, so its relative-frame position error is height only (xy is the robot's
-    # own by construction) and motion_global_anchor_pos already covers that in 3D. It was saturated at kernel
-    # 0.989 in the 25k run -- about 12 of free reward. motion_trunk_ori above stays: it is the tightest roll/pitch
-    # signal there is (std 0.2, against 0.4 for anchor_ori and body_ori), and the reference pitches the torso
-    # ~40 degrees during the pick-up.
-    motion_trunk_pos = None
+    motion_trunk_pos = RewTerm(
+        func=mdp.motion_relative_body_position_error_exp,
+        weight=20.0,
+        params={"command_name": "motion", "std": 0.2, "body_names": ["Trunk"]},
+    )
 
     motion_trunk_ang_vel = RewTerm(
         func=mdp.motion_global_body_angular_velocity_error_exp,
@@ -432,38 +377,27 @@ class RewardsCfg:
     )
 
     # -- object interaction --
-    # Object and grasp weight, against 145 for all body tracking: pose + lin-vel 35, and the interaction term at 25
-    # with gain 5 is 125 on frames where the reference asks for contact and 25 on the rest.
     motion_global_object_pos = RewTerm(
         func=mdp.motion_global_object_position_error_exp,
-        weight=20.0,
+        weight=10.0,
         params={"command_name": "motion", "std": 0.3},
     )
 
     motion_global_object_ori = RewTerm(
         func=mdp.motion_global_object_orientation_error_exp,
-        weight=10.0,
-        params={"command_name": "motion", "std": 0.4},
-    )
-
-    # std 0.5 m/s: the reference box's own speed is p90 0.43 / peak 1.7 m/s, so 0.5 gives full credit while
-    # it is near-still, 0.37 at half a metre per second of error, and ~0 for a box in free fall.
-    motion_global_object_lin_vel = RewTerm(
-        func=mdp.motion_global_object_linear_velocity_error_exp,
         weight=5.0,
-        params={"command_name": "motion", "std": 0.5},
+        params={"command_name": "motion", "std": 0.4},
     )
 
     hand_object_interaction = RewTerm(
         func=mdp.HandObjectInteraction,
-        weight=25.0,
+        weight=20.0,
         params={
             "command_name": "motion",
             "contact_sensor_names": HAND_CONTACT_SENSOR_NAMES,
             "sigma_p": CONTACT_SIGMA_P,
             "sigma_f": CONTACT_SIGMA_F,
             "force_threshold": CONTACT_REWARD_FORCE_THRESHOLD,
-            "gain": CONTACT_GAIN,
         },
     )
 
