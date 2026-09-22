@@ -35,6 +35,14 @@ parser.add_argument(
     help="Use the pre-trained checkpoint from Nucleus.",
 )
 parser.add_argument("--real-time", action="store_true", default=False, help="Run in real-time, if possible.")
+parser.add_argument(
+    "--clip_joint_limits",
+    action="store_true",
+    default=False,
+    help="Clamp the commanded joint targets to the robot's soft joint limits. hoi_track's residual action term "
+    "is unclipped during training, so the reference's own overshoot is commanded verbatim; this renders the "
+    "clipped variant for comparison. Ignored by tasks whose action term has no clip_to_soft_limits option.",
+)
 # append RSL-RL cli arguments
 cli_args.add_rsl_rl_args(parser)
 # append AppLauncher cli args
@@ -96,6 +104,16 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # note: certain randomizations occur in the environment initialization so we set the seed here
     env_cfg.seed = agent_cfg.seed
     env_cfg.sim.device = args_cli.device if args_cli.device is not None else env_cfg.sim.device
+
+    # Render-time only: hoi_track's ResidualJointPositionAction is deliberately unclipped in training. Guarded by
+    # hasattr because play.py is shared with tasks (beyond_mimic, ...) whose action term has no such option.
+    if args_cli.clip_joint_limits:
+        action_cfg = getattr(env_cfg.actions, "joint_pos", None)
+        if action_cfg is not None and hasattr(action_cfg, "clip_to_soft_limits"):
+            action_cfg.clip_to_soft_limits = True
+            print("[INFO] Clamping commanded joint targets to the soft joint limits.")
+        else:
+            print(f"[WARN] --clip_joint_limits ignored: {args_cli.task} has no clippable joint_pos action term.")
 
     # specify directory for logging experiments
     log_root_path = os.path.join("logs", "rsl_rl", agent_cfg.experiment_name)

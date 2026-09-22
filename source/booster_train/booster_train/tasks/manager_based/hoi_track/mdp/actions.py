@@ -49,6 +49,15 @@ class ResidualJointPositionAction(JointPositionAction):
         self._offset = command.motion.joint_pos[command.reference_frames(0)]
         super().process_actions(actions)
 
+        if self.cfg.clip_to_soft_limits:
+            # Clamp the *composed* target, so the reference's own overshoot is clipped along with the policy's
+            # residual. Off during training by design (see above); a play/render-time toggle for seeing what the
+            # motion looks like when the commanded pose is kept physically reachable.
+            limits = self._asset.data.soft_joint_pos_limits[:, self._joint_ids]
+            self._processed_actions = torch.clamp(
+                self._processed_actions, min=limits[..., 0], max=limits[..., 1]
+            )
+
 
 @configclass
 class ResidualJointPositionActionCfg(JointPositionActionCfg):
@@ -58,3 +67,12 @@ class ResidualJointPositionActionCfg(JointPositionActionCfg):
 
     command_name: str = MISSING
     """Name of the :class:`MotionCommand` term supplying the reference pose."""
+
+    clip_to_soft_limits: bool = False
+    """Clamp the composed position target to the asset's soft joint limits.
+
+    Off for training, deliberately: the reference overshoots the soft limits on some frames and the action term
+    stays faithful to the motion file, with ``joint_limit`` paying for the consequences. ``scripts/rsl_rl/play.py``
+    turns it on with ``--clip_joint_limits`` so a render can be compared against the unclipped one. Note this
+    makes the action path agree with ``MotionCommand._resample_command``, which already clips on reset.
+    """

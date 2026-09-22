@@ -377,10 +377,16 @@ class RewardsCfg:
         weight=2.5,
         params={"command_name": "motion", "std": 3.14},
     )
-    action_rate_l2 = RewTerm(func=mdp.action_rate_l2, weight=-4.0)
+    action_rate_l2 = RewTerm(func=mdp.action_rate_l2, weight=-5.0)
+    # sum(raw_action ** 2) -- isaaclab's built-in, operating on env.action_manager.action, the same raw network
+    # output action_rate_l2 reads and what ResidualJointPositionAction's docstring calls "the residual" ("the
+    # env's action *is* the residual"). Deliberately not the physical joint-space delta (raw_action *
+    # K1_ACTION_SCALE, in radians): that would penalise joints unevenly since scale ranges 0.27 (ankles) to
+    # 0.89 (arms), an ~11x spread once squared.
+    action_l2 = RewTerm(func=mdp.action_l2, weight=-5.0)
     joint_limit = RewTerm(
         func=mdp.joint_pos_limits,
-        weight=-10.0,
+        weight=-20.0,
         params={"asset_cfg": SceneEntityCfg("robot", joint_names=[".*"])},
     )
     # Off for the HOI task. It penalises contact on every body but the feet, using the *unfiltered*
