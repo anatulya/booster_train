@@ -32,6 +32,14 @@ parser.add_argument(
     "--distributed", action="store_true", default=False, help="Run training with multiple GPUs or nodes."
 )
 parser.add_argument("--export_io_descriptors", action="store_true", default=False, help="Export IO descriptors.")
+parser.add_argument(
+    "--disable_object_dr",
+    action="store_true",
+    default=False,
+    help="Disable the manipulated object's startup domain randomization (mass, friction/restitution, inertia"
+    " scale, CoM). Ignored by tasks with no such events -- e.g. to train without it first and fine-tune with it"
+    " on later.",
+)
 # append RSL-RL cli arguments
 cli_args.add_rsl_rl_args(parser)
 # append AppLauncher cli args
@@ -150,6 +158,18 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         omni.log.warn(
             "IO descriptors are only supported for manager based RL environments. No IO descriptors will be exported."
         )
+
+    # optionally disable the manipulated object's startup domain randomization
+    if args_cli.disable_object_dr:
+        events_cfg = getattr(env_cfg, "events", None)
+        object_dr_terms = ("object_physics_material", "object_mass", "object_inertia_scale", "object_com")
+        disabled = [name for name in object_dr_terms if getattr(events_cfg, name, None) is not None]
+        for name in disabled:
+            setattr(events_cfg, name, None)
+        if disabled:
+            print(f"[INFO] --disable_object_dr: disabled event terms {disabled}")
+        else:
+            print(f"[WARN] --disable_object_dr ignored: {args_cli.task} has no object DR event terms.")
 
     # create isaac environment
     env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)

@@ -43,6 +43,13 @@ parser.add_argument(
     "is unclipped during training, so the reference's own overshoot is commanded verbatim; this renders the "
     "clipped variant for comparison. Ignored by tasks whose action term has no clip_to_soft_limits option.",
 )
+parser.add_argument(
+    "--disable_object_dr",
+    action="store_true",
+    default=False,
+    help="Disable the manipulated object's startup domain randomization (mass, friction/restitution, inertia"
+    " scale, CoM), e.g. to render against the nominal object. Ignored by tasks with no such events.",
+)
 # append RSL-RL cli arguments
 cli_args.add_rsl_rl_args(parser)
 # append AppLauncher cli args
@@ -114,6 +121,17 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             print("[INFO] Clamping commanded joint targets to the soft joint limits.")
         else:
             print(f"[WARN] --clip_joint_limits ignored: {args_cli.task} has no clippable joint_pos action term.")
+
+    if args_cli.disable_object_dr:
+        events_cfg = getattr(env_cfg, "events", None)
+        object_dr_terms = ("object_physics_material", "object_mass", "object_inertia_scale", "object_com")
+        disabled = [name for name in object_dr_terms if getattr(events_cfg, name, None) is not None]
+        for name in disabled:
+            setattr(events_cfg, name, None)
+        if disabled:
+            print(f"[INFO] --disable_object_dr: disabled event terms {disabled}")
+        else:
+            print(f"[WARN] --disable_object_dr ignored: {args_cli.task} has no object DR event terms.")
 
     # specify directory for logging experiments
     log_root_path = os.path.join("logs", "rsl_rl", agent_cfg.experiment_name)

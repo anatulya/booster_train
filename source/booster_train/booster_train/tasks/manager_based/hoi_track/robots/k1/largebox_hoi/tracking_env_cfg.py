@@ -212,6 +212,9 @@ class CommandsCfg:
             "yaw": (-0.2, 0.2),
         },
         velocity_range=VELOCITY_RANGE,
+        # +-5 cm in the ground plane and +-8 deg of yaw, applied to the box only; the reference stays put, so
+        # this is a genuine placement error the policy has to absorb rather than a shift of the whole task.
+        object_pose_range={"x": (-0.05, 0.05), "y": (-0.05, 0.05), "yaw": (-0.1396, 0.1396)},
         joint_position_range=(-0.1, 0.1),
         future_steps=FUTURE_STEPS,
         palm_body_names=PALM_BODY_NAMES,
@@ -319,6 +322,66 @@ class EventCfg:
             # "asset_cfg": SceneEntityCfg("robot", body_names="torso_link"),
             "asset_cfg": SceneEntityCfg("robot", body_names="Trunk"),
             "com_range": {"x": (-0.025, 0.025), "y": (-0.05, 0.05), "z": (-0.05, 0.05)},
+        },
+    )
+
+    # -- object dynamics --
+    #
+    # Startup, not reset: each env keeps its draw for the whole run. This matches the robot's
+    # physics_material/base_com above and HDMI's object_body_randomization (also a startup()), and avoids the
+    # per-reset CPU-tensor cost the Isaac Lab docstrings warn about. With 4096 envs the ranges stay densely
+    # covered.
+    #
+    # This is the event assets/objects/boxes.py has always claimed exists -- until now the box ran on Isaac's
+    # USD default friction, because the URDF's <contact> block is dropped by the converter.
+    #
+    # HDMI's construction rather than isaaclab's make_consistent: draw dynamic friction, draw a ratio >= 1,
+    # and set static = dynamic * ratio, so static >= dynamic holds by construction. make_consistent instead
+    # clamps dynamic = min(static, dynamic), which satisfies the constraint but biases the dynamic draw --
+    # with both ranges at (0.2, 1.2) it averages 0.53 instead of 0.70, precisely where the clamp bites.
+    #
+    # Side effect worth knowing: static friction now spans 0.2-2.4 (dynamic range x ratio range), wider than
+    # the 0.2-1.2 dynamic range. Narrow the ratio range if that upper end is unwanted.
+    object_physics_material = EventTerm(
+        func=mdp.randomize_rigid_object_material_with_ratio,
+        mode="startup",
+        params={
+            "asset_cfg": SceneEntityCfg("object"),
+            "dynamic_friction_range": (0.2, 1.2),
+            "static_dynamic_friction_ratio_range": (1.0, 2.0),
+            "restitution_range": (0.0, 0.3),
+            "num_buckets": 64,
+        },
+    )
+
+    # Must precede object_inertia_scale: recompute_inertia sets inertia = default_inertia * mass_ratio,
+    # overwriting whatever is there, so the scale has to land on top of it rather than under it.
+    object_mass = EventTerm(
+        func=mdp.randomize_rigid_body_mass,
+        mode="startup",
+        params={
+            "asset_cfg": SceneEntityCfg("object"),
+            "mass_distribution_params": (0.05, 1.5),
+            "operation": "abs",
+            "recompute_inertia": True,
+        },
+    )
+
+    # Independent of the mass coupling above: that keeps inertia consistent with the new mass under a
+    # uniform-density assumption, this perturbs how the mass is distributed.
+    object_inertia_scale = EventTerm(
+        func=mdp.randomize_rigid_object_inertia_scale,
+        mode="startup",
+        params={"asset_cfg": SceneEntityCfg("object"), "scale_range": (0.5, 2.0)},
+    )
+
+    # randomize_rigid_body_com is Articulation-only (see mdp/events.py); the box needs the RigidObject form.
+    object_com = EventTerm(
+        func=mdp.randomize_rigid_object_com,
+        mode="startup",
+        params={
+            "asset_cfg": SceneEntityCfg("object"),
+            "com_range": {"x": (-0.025, 0.025), "y": (-0.025, 0.025), "z": (-0.025, 0.025)},
         },
     )
 

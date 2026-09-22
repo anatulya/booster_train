@@ -510,10 +510,39 @@ class MotionCommand(CommandTerm):
             # Same frame the robot was just placed on, so object and robot start consistent mid-clip too.
             ids = torch.as_tensor(env_ids, dtype=torch.long, device=self.device)
             frames = self.time_steps[ids]
+            object_pos = self.motion.object_pos_w[frames]
+            object_quat = self.motion.object_quat_w[frames]
+
+            # Placement jitter. This has to happen here rather than as a reset-mode event: _reset_idx runs
+            # event_manager.apply("reset") *before* command_manager.reset(), so an event would be overwritten
+            # by the write below a few lines later.
+            #
+            # The reference does not move with it -- ref_object_* stays on the clip -- so the object really is
+            # displaced relative to where the motion says it should be, and motion_global_object_pos/_ori read
+            # that displacement from the first step. For HoiAsym that displacement is unobservable to the
+            # actor (its object terms are all ref_*), so the policy has to learn one placement-averaged grasp
+            # and only feels the offset once the hands make contact. The critic does see the true pose.
+            if self.cfg.object_pose_range:
+                xy_range = [self.cfg.object_pose_range.get(key, (0.0, 0.0)) for key in ["x", "y"]]
+                xy_ranges = torch.tensor(xy_range, device=self.device)
+                xy_samples = sample_uniform(
+                    xy_ranges[:, 0], xy_ranges[:, 1], (len(ids), 2), device=self.device
+                )
+                object_pos = object_pos.clone()
+                object_pos[:, :2] += xy_samples
+
+                yaw_lo, yaw_hi = self.cfg.object_pose_range.get("yaw", (0.0, 0.0))
+                yaw_samples = sample_uniform(yaw_lo, yaw_hi, (len(ids),), device=self.device)
+                zeros = torch.zeros_like(yaw_samples)
+                # World-Z rotation applied on the left, so the box spins about the vertical rather than about
+                # its own (possibly tilted) up axis. z/roll/pitch stay untouched: the box keeps sitting flat.
+                yaw_delta = quat_from_euler_xyz(zeros, zeros, yaw_samples)
+                object_quat = quat_mul(yaw_delta, object_quat)
+
             object_state = torch.cat(
                 [
-                    self.motion.object_pos_w[frames] + self._env.scene.env_origins[ids],
-                    self.motion.object_quat_w[frames],
+                    object_pos + self._env.scene.env_origins[ids],
+                    object_quat,
                     self.motion.object_lin_vel_w[frames],
                     self.motion.object_ang_vel_w[frames],
                 ],
@@ -631,6 +660,13 @@ class MotionCommandCfg(CommandTermCfg):
 
     pose_range: dict[str, tuple[float, float]] = {}
     velocity_range: dict[str, tuple[float, float]] = {}
+    object_pose_range: dict[str, tuple[float, float]] = {}
+    """Reset jitter for the manipulated object, applied to the reference object pose in _resample_command.
+
+    Keys ``x``/``y`` offset the position; ``yaw`` rotates about world Z. ``z``/``roll``/``pitch`` are not
+    supported -- the box is meant to stay flat on whatever it is resting on. Empty (the default) leaves the
+    object exactly on its reference, so tasks that do not set it are unaffected.
+    """
 
     joint_position_range: tuple[float, float] = (-0.52, 0.52)
 
