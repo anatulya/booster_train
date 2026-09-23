@@ -440,7 +440,7 @@ class RewardsCfg:
         weight=2.5,
         params={"command_name": "motion", "std": 3.14},
     )
-    action_rate_l2 = RewTerm(func=mdp.action_rate_l2, weight=-5.0)
+    action_rate_l2 = RewTerm(func=mdp.action_rate_l2, weight=-10.0)
     # sum(raw_action ** 2) -- isaaclab's built-in, operating on env.action_manager.action, the same raw network
     # output action_rate_l2 reads and what ResidualJointPositionAction's docstring calls "the residual" ("the
     # env's action *is* the residual"). Deliberately not the physical joint-space delta (raw_action *
@@ -452,15 +452,87 @@ class RewardsCfg:
         weight=-20.0,
         params={"asset_cfg": SceneEntityCfg("robot", joint_names=[".*"])},
     )
+    # ULTRA's effort and smoothness regularizers. torque_l2 and energy read the applied torque; torque_limit reads
+    # the pre-clip PD torque, since the applied one is clipped to the limit and would cap the term at 0.05 per
+    # joint. The two *_change terms are per 50 Hz control step, and score zero on the first step after a reset.
+    #
+    # The dense five run at 100x ULTRA's weights (joint_vel_change_l2 at 500x). At ULTRA's own values they
+    # summed to 0.03% of the positive reward at 21k iterations and never moved. The jerk they target is the
+    # policy's, not the clip's: sum (dq/dt change)^2 per step is 0.79 on sub3_largebox_003's reference against
+    # 6.7 for the deterministic 22k policy, so joint_vel_change_l2 costs a policy that tracks smoothly almost
+    # nothing (~0.2). From scratch it does drive the per-step reward negative for the first iterations (-11 mean
+    # at iteration 30); accepted, on the expectation that tracking catches up. action_rate_l2 does not do this job -- it sees PD-target changes, not the joint
+    # accelerations that come out of the actuator delay and PD response.
+    #
+    # Read their training curves with care: exploration noise (std ~0.27) dominates them. At 22k the same
+    # policy scores 41 on joint_vel_change_l2 sampling actions against 6.7 acting deterministically, and 3.6
+    # against 0.32 on action_rate_l2. The curves fall only as fast as the std does; measure smoothness on the
+    # deterministic policy.
+    joint_torque_l2 = RewTerm(
+        func=mdp.joint_torques_l2,
+        weight=-2.5e-4,
+        params={"asset_cfg": SceneEntityCfg("robot", joint_names=[".*"])},
+    )
+    joint_energy = RewTerm(
+        func=mdp.joint_energy,
+        weight=-2.5e-2,
+        params={"asset_cfg": SceneEntityCfg("robot", joint_names=[".*"])},
+    )
+    joint_torque_limit = RewTerm(
+        func=mdp.joint_torque_limit_ratio,
+        weight=-2.5,
+        params={"soft_ratio": 0.95, "asset_cfg": SceneEntityCfg("robot", joint_names=[".*"])},
+    )
+    joint_vel_change_l2 = RewTerm(
+        func=mdp.JointVelChangeL2,
+        weight=-0.25,
+        params={"asset_cfg": SceneEntityCfg("robot", joint_names=[".*"])},
+    )
+    base_ang_vel_change_l2 = RewTerm(
+        func=mdp.BaseAngVelChangeL2,
+        weight=-1.0,
+        params={"asset_cfg": SceneEntityCfg("robot")},
+    )
+    joint_vel_l2 = RewTerm(
+        func=mdp.joint_vel_l2,
+        weight=-1e-2,
+        params={"asset_cfg": SceneEntityCfg("robot", joint_names=[".*"])},
+    )
+    # ULTRA's foot terms; the weights are ours. The clips' feet are not flat -- sub3_largebox_003 holds them
+    # rolled ~22 deg onto their edges through the final hold, a retargeting artifact -- and feet_orientation pulls
+    # them flat anyway. It only has to beat the loose motion_foot_tilt below, not a stiff full-orientation term:
+    # against the old motion_foot_ori (15, std 0.2) a -10 penalty bought ~1 deg of flattening. Expected balance
+    # at -20 against tilt (5, std 0.5) is ~12 of ~18 deg flattened; lower motion_foot_tilt's weight for more.
+    feet_orientation = RewTerm(
+        func=mdp.feet_orientation_l2,
+        weight=-20.0,
+        params={"asset_cfg": SceneEntityCfg("robot", body_names=["left_foot_link", "right_foot_link"])},
+    )
+    feet_stumble = RewTerm(
+        func=mdp.feet_stumble,
+        weight=-10.0,
+        params={
+            "sensor_cfg": SceneEntityCfg("contact_forces", body_names=["left_foot_link", "right_foot_link"]),
+            "ratio": 4.0,
+        },
+    )
     # Off for the HOI task. It penalises contact on every body but the feet, using the *unfiltered*
     # contact_forces sensor, so a hand pressing on the object earns the interaction reward and is fined -10 for
     # touching anything at the same time -- the two terms directly cancel. Re-enable with the hands excluded
     # from body_names if the robot needs a penalty for faceplanting.
     undesired_contacts = None
-    motion_foot_ori = RewTerm(
-        func=mdp.motion_relative_body_orientation_error_exp,
+    # Foot orientation, split in two. Heading is tracked as tightly as the old full-orientation term was; tilt only
+    # loosely (std 0.5 rad, ~29 deg), as a guard against feet wildly off the clip rather than a hold on the
+    # clip's rolled feet -- see feet_orientation above.
+    motion_foot_yaw = RewTerm(
+        func=mdp.motion_relative_body_yaw_error_exp,
         weight=15.0,
         params={"command_name": "motion", "std": 0.2, "body_names": ["left_foot_link", "right_foot_link"]},
+    )
+    motion_foot_tilt = RewTerm(
+        func=mdp.motion_relative_body_tilt_error_exp,
+        weight=5.0,
+        params={"command_name": "motion", "std": 0.5, "body_names": ["left_foot_link", "right_foot_link"]},
     )
 
     motion_foot_pos = RewTerm(

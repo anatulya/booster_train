@@ -468,16 +468,13 @@ class MotionCommand(CommandTerm):
     def _resample_command(self, env_ids: Sequence[int]):
         if len(env_ids) == 0:
             return
+        self._adaptive_sampling(env_ids)
 
         if self.cfg.play:
-            # Deal the clips out across envs so one play/export run shows every
-            # motion from its first frame. Do not invoke the training-only
-            # adaptive sampler in this mode.
+            # Deal the clips out across envs so one play run shows every motion from its first frame.
             ids = torch.as_tensor(env_ids, dtype=torch.long, device=self.device)
             self.motion_ids[ids] = ids % self.motion.num_clips
             self.time_steps[ids] = self.motion.clip_starts[self.motion_ids[ids]]
-        else:
-            self._adaptive_sampling(env_ids)
 
         root_pos = self.body_pos_w[:, 0].clone()
         root_ori = self.body_quat_w[:, 0].clone()

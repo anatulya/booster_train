@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING, Union
 
 from isaaclab.managers import ManagerTermBase, RewardTermCfg, SceneEntityCfg
 from isaaclab.sensors import ContactSensor
-from isaaclab.utils.math import quat_apply, quat_error_magnitude
+from isaaclab.utils.math import quat_apply, quat_apply_inverse, quat_error_magnitude, yaw_quat
 
 from booster_train.tasks.manager_based.hoi_track.mdp.commands import MotionCommand
 
@@ -69,6 +69,47 @@ def motion_relative_body_orientation_error_exp(
         quat_error_magnitude(command.body_quat_relative_w[:, body_indexes], command.robot_body_quat_w[:, body_indexes])
         ** 2
     ).mean(dim=-1)
+    std = _get_adaptive_sigma(env, std, error.mean())
+    return torch.exp(-error / std**2)
+
+
+def motion_relative_body_yaw_error_exp(
+    env: ManagerBasedRLEnv, command_name: str, std: float | str, body_names: list[str] | None = None
+) -> torch.Tensor:
+    """The heading half of :func:`motion_relative_body_orientation_error_exp`: yaw error only, tilt ignored.
+
+    Paired with :func:`motion_relative_body_tilt_error_exp` so the two halves can be weighted separately. The
+    split is clean because ``body_quat_relative_w`` aligns the reference to the robot by yaw alone, so it still
+    carries the reference's own tilt for the tilt half to compare against.
+    """
+    command: MotionCommand = env.command_manager.get_term(command_name)
+    body_indexes = _get_body_indexes(command, body_names)
+    error = (
+        quat_error_magnitude(
+            yaw_quat(command.body_quat_relative_w[:, body_indexes]), yaw_quat(command.robot_body_quat_w[:, body_indexes])
+        )
+        ** 2
+    ).mean(dim=-1)
+    std = _get_adaptive_sigma(env, std, error.mean())
+    return torch.exp(-error / std**2)
+
+
+def motion_relative_body_tilt_error_exp(
+    env: ManagerBasedRLEnv, command_name: str, std: float | str, body_names: list[str] | None = None
+) -> torch.Tensor:
+    """The tilt half: the angle between gravity seen from the reference body and from the robot body.
+
+    Gravity in a body's frame does not change under a yaw of that body, so this is blind to heading by
+    construction and does not double-count :func:`motion_relative_body_yaw_error_exp`.
+    """
+    command: MotionCommand = env.command_manager.get_term(command_name)
+    body_indexes = _get_body_indexes(command, body_names)
+    ref_quat = command.body_quat_relative_w[:, body_indexes]
+    gravity = command.robot.data.GRAVITY_VEC_W[:, None, :].expand(-1, len(body_indexes), -1)
+    g_ref = quat_apply_inverse(ref_quat, gravity)
+    g_robot = quat_apply_inverse(command.robot_body_quat_w[:, body_indexes], gravity)
+    angle = torch.atan2(torch.norm(torch.cross(g_ref, g_robot, dim=-1), dim=-1), torch.sum(g_ref * g_robot, dim=-1))
+    error = (angle**2).mean(dim=-1)
     std = _get_adaptive_sigma(env, std, error.mean())
     return torch.exp(-error / std**2)
 
@@ -307,3 +348,94 @@ class HandObjectInteraction(ManagerTermBase):
         self.sums["force"] += weighted(force)
         self.counts += active
         return reward
+
+
+# -- regularization (ULTRA) --
+
+
+def joint_energy(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
+    """Mechanical power, ``sum(|tau * qdot|)``, on the torque the joints actually applied."""
+    asset = env.scene[asset_cfg.name]
+    power = asset.data.applied_torque[:, asset_cfg.joint_ids] * asset.data.joint_vel[:, asset_cfg.joint_ids]
+    return torch.sum(torch.abs(power), dim=1)
+
+
+def joint_torque_limit_ratio(
+    env: ManagerBasedRLEnv, soft_ratio: float = 0.95, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")
+) -> torch.Tensor:
+    """``sum(max(0, |tau| / tau_lim - soft_ratio))``, on the *computed* (pre-clip) PD torque.
+
+    Not ``applied_torque``: the Booster actuators clip that to the effort limit (lower still at speed), so its
+    ratio can never pass 1.0 and the term would cap at ``1 - soft_ratio`` per joint. The computed torque keeps
+    growing with how hard the policy asks past saturation, which is the gradient worth having.
+    """
+    asset = env.scene[asset_cfg.name]
+    tau = asset.data.computed_torque[:, asset_cfg.joint_ids]
+    tau_lim = asset.data.joint_effort_limits[:, asset_cfg.joint_ids]
+    return torch.sum(torch.clamp(tau.abs() / tau_lim - soft_ratio, min=0.0), dim=1)
+
+
+class _StateChangeL2(ManagerTermBase):
+    """``||x_t - x_{t-1}||^2`` between consecutive env steps, for a quantity ``_read`` returns.
+
+    The previous value is taken on the first step after a reset rather than in :meth:`reset`, because the reward
+    manager resets before the new state has been stepped into ``asset.data``; that first step scores zero, so the
+    reset teleport is never penalised.
+    """
+
+    def __init__(self, cfg: RewardTermCfg, env: ManagerBasedRLEnv):
+        super().__init__(cfg, env)
+        self.prev: torch.Tensor | None = None
+        self.fresh = torch.ones(self.num_envs, dtype=torch.bool, device=self.device)
+
+    def reset(self, env_ids: Sequence[int] | None = None) -> None:
+        self.fresh[slice(None) if env_ids is None else env_ids] = True
+
+    def _read(self, env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg) -> torch.Tensor:
+        raise NotImplementedError
+
+    def __call__(self, env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
+        x = self._read(env, asset_cfg)
+        if self.prev is None:
+            self.prev = x.clone()
+        self.prev[self.fresh] = x[self.fresh]
+        penalty = torch.sum(torch.square(x - self.prev), dim=1)
+        self.prev[:] = x
+        self.fresh[:] = False
+        return penalty
+
+
+class JointVelChangeL2(_StateChangeL2):
+    """``||qdot_t - qdot_{t-1}||^2`` per control step."""
+
+    def _read(self, env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg) -> torch.Tensor:
+        return env.scene[asset_cfg.name].data.joint_vel[:, asset_cfg.joint_ids]
+
+
+class BaseAngVelChangeL2(_StateChangeL2):
+    """``||omega_t - omega_{t-1}||^2`` per control step, in the base frame -- what the IMU measures."""
+
+    def _read(self, env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg) -> torch.Tensor:
+        return env.scene[asset_cfg.name].data.root_ang_vel_b
+
+
+def feet_orientation_l2(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
+    """``sum ||g_foot_xy||^2``: foot tilt from gravity, from the gravity vector rotated into each foot's frame.
+
+    Ungated, so it applies in swing as well as stance, the same form ULTRA uses.
+    """
+    asset = env.scene[asset_cfg.name]
+    quat = asset.data.body_quat_w[:, asset_cfg.body_ids]  # (N, F, 4)
+    gravity = asset.data.GRAVITY_VEC_W[:, None, :].expand(-1, quat.shape[1], -1)
+    gravity_foot = quat_apply_inverse(quat, gravity)
+    return torch.sum(torch.square(gravity_foot[..., :2]), dim=(1, 2))
+
+
+def feet_stumble(env: ManagerBasedRLEnv, sensor_cfg: SceneEntityCfg, ratio: float = 4.0) -> torch.Tensor:
+    """Number of feet whose contact force is mostly horizontal, ``||f_xy|| > ratio * |f_z|`` -- a foot kicking a
+    step edge or scraping sideways rather than bearing load. A foot in the air has zero force and scores 0.
+    """
+    sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
+    force = sensor.data.net_forces_w[:, sensor_cfg.body_ids]  # (N, F, 3)
+    stumbling = torch.norm(force[..., :2], dim=-1) > ratio * torch.abs(force[..., 2])
+    return torch.sum(stumbling.float(), dim=1)

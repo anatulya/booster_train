@@ -40,7 +40,6 @@ import os  # noqa: E402
 import torch  # noqa: E402
 
 import booster_train.tasks  # noqa: F401, E402
-from isaaclab.managers import EventTermCfg  # noqa: E402
 from booster_train.tasks.manager_based.hoi_track.mdp import observations as O  # noqa: E402
 from isaaclab_tasks.utils import parse_env_cfg  # noqa: E402
 
@@ -62,34 +61,10 @@ REF_TERMS = (
 
 def main() -> None:
     env_cfg = parse_env_cfg(args_cli.task, device=args_cli.device, num_envs=1)
-
-    # Baking is a deterministic conversion of a motion, not a training rollout.
-    # Disable every source of training-time domain randomization before the
-    # environment is constructed:
-    #   - Event terms randomize robot/object physics and apply interval pushes.
-    #   - MotionCommand ranges perturb the reset pose, velocity, joints and object.
-    #   - play=True forces the single clip to reset at frame zero instead of
-    #     adaptive sampling choosing an arbitrary mid-motion frame.
-    events_cfg = getattr(env_cfg, "events", None)
-    if events_cfg is not None:
-        for name, term in vars(events_cfg).items():
-            if isinstance(term, EventTermCfg):
-                setattr(events_cfg, name, None)
-
-    motion_cfg = env_cfg.commands.motion
-    motion_cfg.play = True
-    motion_cfg.pose_range = {}
-    motion_cfg.velocity_range = {}
-    motion_cfg.object_pose_range = {}
-    motion_cfg.joint_position_range = (0.0, 0.0)
-
-    # Reference terms are uncorrupted by construction, but turn observation
-    # corruption off as well so this exporter cannot accidentally bake noise if
-    # more terms are added later.
-    for group_name in ("policy", "critic"):
-        group = getattr(env_cfg.observations, group_name, None)
-        if group is not None:
-            group.enable_corruption = False
+    # add_joint_default_pos randomizes default_joint_pos by +-0.01 rad at startup. That offset is training-time
+    # domain randomization, not a property of the robot, and hardware has the nominal pose -- exporting the
+    # randomized value would bias joint_pos_rel by up to 0.01 rad on every deployed step.
+    env_cfg.events.add_joint_default_pos = None
     env = gym.make(args_cli.task, cfg=env_cfg).unwrapped
     env.reset()
 
