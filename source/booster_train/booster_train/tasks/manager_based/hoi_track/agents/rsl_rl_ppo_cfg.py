@@ -10,13 +10,10 @@ class BasePPORunnerCfg(RslRlOnPolicyRunnerCfg):
     experiment_name = "hoi_track"
     empirical_normalization = True
     policy = RslRlPpoActorCriticCfg(
-        # 0.35, not the usual 1.0: the residual action means the mean already sits on the reference, and our
+        # 0.5, not the usual 1.0: the residual action means the mean already sits on the reference, and our
         # arm action scale (0.887) is 2x HDMI's, so std 1.0 would shake the hands with 51 deg per arm joint
-        # while they are meant to be holding the box. 0.5 matched HDMI's 25.4 deg on the arms, but a from-scratch
-        # run left to itself fell from 0.5 to 0.34 within 200 iterations and settled at ~0.36 for 20k, so 0.5
-        # only bought early noise -- which the smoothness penalties then pay for, in proportion to std^2. 0.35
-        # (17.8 deg on the arms) starts where the policy ends up anyway.
-        init_noise_std=0.35,
+        # while they are meant to be holding the box. 0.5 puts the arms at 25.4 deg, HDMI's exact figure.
+        init_noise_std=0.5,
         actor_hidden_dims=[512, 256, 128],
         critic_hidden_dims=[512, 256, 128],
         activation="elu",
