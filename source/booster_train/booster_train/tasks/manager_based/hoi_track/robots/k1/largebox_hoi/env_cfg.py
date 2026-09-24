@@ -1,11 +1,13 @@
 import glob
 import os
 
+import numpy as np
+
 from isaaclab.managers import ObservationTermCfg as ObsTerm
 from isaaclab.utils import configclass
 
 from booster_assets import BOOSTER_ASSETS_DIR
-from booster_train.assets.objects.boxes import LARGEBOX_0539923_CFG, SUITCASE_0539923_CFG
+from booster_train.assets.objects.boxes import CLIP_TOKEN_TO_OBJECT, OBJECT_CFGS, OBJECT_NAMES, object_link
 from booster_train.assets.robots.booster import BOOSTER_K1_CFG as ROBOT_CFG, K1_ACTION_SCALE
 from booster_train.tasks.manager_based.hoi_track import mdp
 
@@ -17,24 +19,47 @@ from .tracking_env_cfg import HORIZON, TrackingEnvCfg
 # come next.
 MOTION_DIR = f"{BOOSTER_ASSETS_DIR}/motions/K1/hoi_track/npz"
 ALL_MOTION_FILES = sorted(glob.glob(f"{MOTION_DIR}/*_hold.npz"))
+
+
+def _clip_object(path: str) -> str:
+    """The object asset one clip was captured with.
+
+    The npz's own ``object_name`` (written by pt_to_npz_with_offline_video.py from --object) wins. Clips converted
+    before that key existed fall back to their file name, matched on whole tokens against CLIP_TOKEN_TO_OBJECT.
+    Anything else is an error: guessing is how smallbox and BEHAVE clips used to be handed the largebox.
+    """
+    with np.load(path) as data:
+        if "object_name" in data.files:
+            name = str(data["object_name"])
+            if name not in OBJECT_CFGS:
+                raise ValueError(f"{path}: object_name {name!r} has no asset; known objects: {OBJECT_NAMES}")
+            return name
+    tokens = set(os.path.basename(path).removesuffix(".npz").split("_"))
+    matches = {CLIP_TOKEN_TO_OBJECT[t] for t in tokens & CLIP_TOKEN_TO_OBJECT.keys()}
+    if len(matches) != 1:
+        found = f"matches {sorted(matches)}" if matches else "names no known object"
+        raise ValueError(
+            f"{path}: no object_name key and the file name {found}. Reconvert it with"
+            f" pt_to_npz_with_offline_video.py --object <name> (one of {OBJECT_NAMES}), which records it."
+        )
+    return matches.pop()
+
+
+def object_name_for(motion_file: str | list[str]) -> str:
+    """The object asset a clip, or a set of clips that must share one scene, was captured with."""
+    paths = [motion_file] if isinstance(motion_file, str) else list(motion_file)
+    names = {_clip_object(p) for p in paths}
+    if len(names) != 1:
+        raise ValueError(f"clips disagree on the captured object ({names}); train one object at a time.")
+    return names.pop()
+
+
 # One scene holds one object, so the multi-clip task takes whichever object has the most clips here; the
 # single-clip tasks below cover every clip, each with the object it was captured with.
 _BY_OBJECT: dict[str, list[str]] = {}
 for _p in ALL_MOTION_FILES:
-    _BY_OBJECT.setdefault("suitcase_0539923" if "suitcase" in os.path.basename(_p) else "largebox_0539923", []).append(_p)
+    _BY_OBJECT.setdefault(_clip_object(_p), []).append(_p)
 MOTION_FILES = max(_BY_OBJECT.values(), key=len) if _BY_OBJECT else []
-
-# Which captured object a clip interacted with, taken from its file name.
-OBJECT_CFGS = {"suitcase_0539923": SUITCASE_0539923_CFG, "largebox_0539923": LARGEBOX_0539923_CFG}
-
-
-def object_name_for(motion_file: str | list[str]) -> str:
-    """The object asset a clip was captured with: suitcase clips carry 'suitcase' in their file name."""
-    paths = [motion_file] if isinstance(motion_file, str) else list(motion_file)
-    names = {"suitcase_0539923" if "suitcase" in os.path.basename(p) else "largebox_0539923" for p in paths}
-    if len(names) != 1:
-        raise ValueError(f"clips disagree on the captured object ({names}); train one object at a time.")
-    return names.pop()
 
 K1_TRACK_BODY_NAMES = [
     "Trunk", "Head_2",
@@ -62,7 +87,7 @@ class FlatEnvCfg(TrackingEnvCfg):
         name = object_name_for(self.commands.motion.motion_file)
         self.scene.object = OBJECT_CFGS[name].replace(prim_path="{ENV_REGEX_NS}/Object")
         for sensor in (self.scene.left_hand_object_contact, self.scene.right_hand_object_contact):
-            sensor.filter_prim_paths_expr = ["{ENV_REGEX_NS}/Object/" + f"{name}_link"]
+            sensor.filter_prim_paths_expr = ["{ENV_REGEX_NS}/Object/" + object_link(name)]
 
 
 @configclass

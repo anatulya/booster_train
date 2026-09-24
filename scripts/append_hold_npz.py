@@ -30,7 +30,7 @@ import numpy as np
 POSE_KEYS = ("joint_pos", "body_pos_w", "body_quat_w", "object_pos_w", "object_quat_w", "contact")
 VELOCITY_KEYS = ("joint_vel", "body_lin_vel_w", "body_ang_vel_w", "object_lin_vel_w", "object_ang_vel_w")
 META_KEYS = ("fps", "joint_names", "body_names")
-OPTIONAL_META_KEYS = ("contact_names",)
+OPTIONAL_META_KEYS = ("contact_names", "object_name")
 
 
 QUAT_KEYS = ("body_quat_w", "object_quat_w")

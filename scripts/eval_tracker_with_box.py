@@ -23,8 +23,9 @@ parser.add_argument("--policy", required=True, help="TorchScript policy exported
 parser.add_argument("--clip", default="sub12_largebox_014", help="Clip name under motions/K1/tracker/npz.")
 parser.add_argument("--out", default="logs/eval_box")
 parser.add_argument("--tag", default=None, help="Suffix for the output files (default: policy file stem).")
-parser.add_argument("--object", choices=["largebox_0539923", "suitcase_0539923", "suitcase_0674904", "suitcase_tall15", "suitcase_tall18", "suitcase_tall15_w125", "suitcase_tall15_w140"], default="largebox_0539923",
-                    help="Captured object of the clip; must match what the reference interacted with.")  # fmt: skip
+parser.add_argument("--object", default="largebox_0539923",
+                    help="Captured object of the clip; must match what the reference interacted with. Any"
+                         " booster_assets/motions/K1/<name>/<name>.urdf.")  # fmt: skip
 parser.add_argument("--box_mass", type=float, default=0.5)
 parser.add_argument("--friction", type=float, default=None,
                     help="Static/dynamic friction for robot and box; default: the scene's material (1.0, multiply).")  # fmt: skip
@@ -59,31 +60,16 @@ from isaaclab.sensors import CameraCfg, ContactSensorCfg
 
 from booster_assets import BOOSTER_ASSETS_DIR
 from booster_train.assets.robots.booster import BOOSTER_K1_BIGHANDS_CFG
-from booster_train.assets.objects.boxes import (
-    LARGEBOX_0539923_CFG,
-    SUITCASE_0539923_CFG,
-    SUITCASE_0674904_CFG,
-    SUITCASE_TALL15_CFG,
-    SUITCASE_TALL15_W125_CFG,
-    SUITCASE_TALL15_W140_CFG,
-    SUITCASE_TALL18_CFG,
-)
+from booster_train.assets.objects.boxes import OBJECT_CFGS, OBJECT_DIR, OBJECT_NAMES, object_link
 from booster_train.tasks.manager_based.beyond_mimic.robots.k1.largebox_tracker.env_cfg import (
     PlayFlatWoStateEstimationEnvCfg,
 )
 
-OBJECT_CFGS = {
-    "largebox_0539923": LARGEBOX_0539923_CFG,
-    "suitcase_0539923": SUITCASE_0539923_CFG,
-    "suitcase_0674904": SUITCASE_0674904_CFG,
-    "suitcase_tall15": SUITCASE_TALL15_CFG,
-    "suitcase_tall18": SUITCASE_TALL18_CFG,
-    "suitcase_tall15_w125": SUITCASE_TALL15_W125_CFG,
-    "suitcase_tall15_w140": SUITCASE_TALL15_W140_CFG,
-}
+if args_cli.object not in OBJECT_CFGS:
+    parser.error(f"--object {args_cli.object!r} has no asset; choose one of {OBJECT_NAMES}")
 OBJECT_CFG = OBJECT_CFGS[args_cli.object]
-BOX_LINK = f"{args_cli.object}_link"
-BOX_MESH = f"{BOOSTER_ASSETS_DIR}/motions/K1/{args_cli.object}/{args_cli.object}.obj"
+BOX_LINK = object_link(args_cli.object)
+BOX_MESH = f"{OBJECT_DIR}/{args_cli.object}/{args_cli.object}.obj"
 # Same slab as replay_pd_references.py: barely wider than the box so the robot cannot stand on it.
 SUPPORT_HEIGHT = 0.5
 

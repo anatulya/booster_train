@@ -77,8 +77,11 @@ parser.add_argument(
     "--object",
     type=str,
     default="smallbox_0539923",
-    choices=("smallbox_0539923", "largebox_0539923", "suitcase_0539923", "suitcase_0674904", "suitcase_tall15", "suitcase_tall18", "suitcase_tall15_w125", "suitcase_tall15_w140"),
-    help="Which captured object the motion interacts with; must match the source capture.",
+    help=(
+        "Which captured object the motion interacts with; must match the source capture. Any directory"
+        " booster_assets/motions/K1/<name>/<name>.urdf. Recorded in the npz as object_name, which is how the HOI"
+        " task picks the object to simulate."
+    ),
 )
 parser.add_argument("--video", type=str, default=None, help="Optional output MP4 path for offline rendering.")
 parser.add_argument("--video_width", type=int, default=1280, help="Rendered video width.")
@@ -240,32 +243,14 @@ from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR
 # Pre-defined configs
 ##
 from booster_train.assets.robots.booster import BOOSTER_K1_CFG as ROBOT_CFG
-from booster_assets import BOOSTER_ASSETS_DIR
-from booster_train.assets.objects.boxes import (
-    LARGEBOX_0539923_CFG,
-    SMALLBOX_0539923_CFG,
-    SUITCASE_0539923_CFG,
-    SUITCASE_0674904_CFG,
-    SUITCASE_TALL15_CFG,
-    SUITCASE_TALL15_W125_CFG,
-    SUITCASE_TALL15_W140_CFG,
-    SUITCASE_TALL18_CFG,
-)
+from booster_train.assets.objects.boxes import OBJECT_CFGS, OBJECT_DIR, OBJECT_NAMES
 
 # The object is only replayed kinematically here, but it has to be the right mesh: the npz carries the object
 # pose straight through, and the rendered video is what tells you the capture and the asset agree.
-OBJECT_CFGS = {
-    "smallbox_0539923": SMALLBOX_0539923_CFG,
-    "largebox_0539923": LARGEBOX_0539923_CFG,
-    "suitcase_0539923": SUITCASE_0539923_CFG,
-    "suitcase_0674904": SUITCASE_0674904_CFG,
-    "suitcase_tall15": SUITCASE_TALL15_CFG,
-    "suitcase_tall18": SUITCASE_TALL18_CFG,
-    "suitcase_tall15_w125": SUITCASE_TALL15_W125_CFG,
-    "suitcase_tall15_w140": SUITCASE_TALL15_W140_CFG,
-}
+if args_cli.object not in OBJECT_CFGS:
+    parser.error(f"--object {args_cli.object!r} has no asset; choose one of {OBJECT_NAMES}")
 OBJECT_CFG = OBJECT_CFGS[args_cli.object]
-OBJECT_MESH = f"{BOOSTER_ASSETS_DIR}/motions/K1/{args_cli.object}/{args_cli.object}.obj"
+OBJECT_MESH = f"{OBJECT_DIR}/{args_cli.object}/{args_cli.object}.obj"
 SUPPORT_SIZE = tuple(args_cli.support_size)
 SUPPORT_MIN_HEIGHT = 0.05
 
@@ -651,6 +636,7 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
         "joint_names": np.array(robot.joint_names),
         "body_names": np.array(robot.body_names),
         "contact_names": np.array(CONTACT_NAMES),
+        "object_name": np.array(args_cli.object),
     }
     file_saved = False
     # --------------------------------------------------------------------------
