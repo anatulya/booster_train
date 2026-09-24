@@ -53,19 +53,27 @@ def object_cfg(name: str) -> RigidObjectCfg:
 
 OBJECT_CFGS = {name: object_cfg(name) for name in OBJECT_NAMES}
 
+
+def _named_cfg(name: str) -> RigidObjectCfg:
+    """The registry entry, or -- when that asset folder is not on this machine (booster_assets is gitignored) -- the same
+    cfg built from the path anyway. Importing this module must not depend on which assets happen to be synced; a
+    missing asset should fail when something tries to spawn it."""
+    return OBJECT_CFGS.get(name) or object_cfg(name)
+
+
 # Named handles kept for the scripts that import them. Retargeted from the InterMimic sub4_smallbox_047 capture.
-SMALLBOX_0539923_CFG = OBJECT_CFGS["smallbox_0539923"].replace(
+SMALLBOX_0539923_CFG = _named_cfg("smallbox_0539923").replace(
     init_state=RigidObjectCfg.InitialStateCfg(pos=(0.0, 0.0, 0.1))
 )
 OBJECT_CFGS["smallbox_0539923"] = SMALLBOX_0539923_CFG
 # The OMOMO largebox and suitcase at the 0.539923 scale, used by the sub*_largebox_* / sub*_suitcase_* references.
-LARGEBOX_0539923_CFG = OBJECT_CFGS["largebox_0539923"]
-SUITCASE_0539923_CFG = OBJECT_CFGS["suitcase_0539923"]
+LARGEBOX_0539923_CFG = _named_cfg("largebox_0539923")
+SUITCASE_0539923_CFG = _named_cfg("suitcase_0539923")
 # The same suitcase at a larger 0.674904 scale, for testing whether a bigger object is easier to grip.
-SUITCASE_0674904_CFG = OBJECT_CFGS["suitcase_0674904"]
+SUITCASE_0674904_CFG = _named_cfg("suitcase_0674904")
 # The 0.539923 suitcase stretched 1.5x / 1.8x along its own up axis (base kept in place), so its sides reach the
 # height the reference hands close at; the _w125 / _w140 variants widen tall15 1.25x / 1.4x in plan.
-SUITCASE_TALL15_CFG = OBJECT_CFGS["suitcase_tall15"]
-SUITCASE_TALL18_CFG = OBJECT_CFGS["suitcase_tall18"]
-SUITCASE_TALL15_W125_CFG = OBJECT_CFGS["suitcase_tall15_w125"]
-SUITCASE_TALL15_W140_CFG = OBJECT_CFGS["suitcase_tall15_w140"]
+SUITCASE_TALL15_CFG = _named_cfg("suitcase_tall15")
+SUITCASE_TALL18_CFG = _named_cfg("suitcase_tall18")
+SUITCASE_TALL15_W125_CFG = _named_cfg("suitcase_tall15_w125")
+SUITCASE_TALL15_W140_CFG = _named_cfg("suitcase_tall15_w140")
