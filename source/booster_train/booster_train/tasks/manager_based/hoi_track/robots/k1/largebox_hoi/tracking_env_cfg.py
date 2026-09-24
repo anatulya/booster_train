@@ -56,28 +56,33 @@ CONTACT_SIGMA_F = 40.0
 # 139 for all body tracking combined -- close to HDMI, which runs grasping at 1:1 with its tracking group.
 CONTACT_GAIN = 5.0
 
-# Early termination. LOST_CONTACT_* are HDMI's cum_lost_contact_steps values (hdmi-base.yaml:269), and the
-# force bound stays far below the reward's grip threshold on purpose: between 1 N and CONTACT_REWARD_FORCE_-
-# THRESHOLD is a deadband where a hand is neither paid in full nor killed. LostContact now fires on either
+# Early termination. LOST_CONTACT_FORCE / _DISTANCE are HDMI's cum_lost_contact_steps values (hdmi-base.yaml:269),
+# and the force bound stays far below the reward's grip threshold on purpose: between 1 N and CONTACT_REWARD_-
+# FORCE_THRESHOLD is a deadband where a hand is neither paid in full nor killed. LostContact now fires on either
 # condition rather than both, so that deadband no longer shelters a hand that is simply in the wrong place.
+#
+# LOST_CONTACT_STEPS, OBJECT_ORI_STEPS and OBJECT_POS_STEPS are all 75 (1.5 s at 50 Hz), not HDMI's 25. At 25 a
+# slipped grasp ended the episode in 0.5 s, so the policy never saw what recovering from one looks like -- and on
+# hardware it fails grasps. object_ori and object_pos get the same window because a failed grasp usually tips or
+# displaces the box, which would otherwise cut the lost-contact window short with a different termination.
 #
 # OBJECT_POS_TERMINATION is measured in the robot's heading frame (see BadObjectPos), not in world, so it is
 # a budget for "the box is misplaced relative to me" and not for global drift. The world-frame version of this
 # check fired on 40.6% of episodes at 5.7k iterations, almost all of it root drift rather than dropping.
 #
-# OBJECT_POS_STEPS mirrors LOST_CONTACT_STEPS: an env reset into the lift-off spawns the box in mid-air with
-# the reference already asking for a grip, and had ~16 steps before free fall breached the bound. The counter
-# gives it time to close the hands instead of dying on the reset condition.
+# OBJECT_POS_STEPS also covers resets into the lift-off, which spawn the box in mid-air with the reference
+# already asking for a grip and had ~16 steps before free fall breached the bound -- time to close the hands
+# instead of dying on the reset condition.
 OBJECT_POS_TERMINATION = 0.5
-OBJECT_POS_STEPS = 25
+OBJECT_POS_STEPS = 75
 # 1.2 rad (69 deg) clears the motion's own object rotation: measured from its start in the root heading frame,
 # the reference box turns at most 0.924 rad (sub1) / 0.569 rad (sub15) and never spends a frame past 1.2. So
 # this cannot fire on a policy that simply fails to rotate the box -- it only catches genuine tipping.
 OBJECT_ORI_TERMINATION = 1.2
-OBJECT_ORI_STEPS = 25
+OBJECT_ORI_STEPS = 75
 LOST_CONTACT_FORCE = 1.0
 LOST_CONTACT_DISTANCE = 0.2
-LOST_CONTACT_STEPS = 25
+LOST_CONTACT_STEPS = 75
 
 # Reference horizon, in motion frames at 50 Hz: now, +20 ms, +40 ms, +160 ms, +320 ms. The policy is a plain
 # MLP with no history, so without a horizon it cannot anticipate -- which matters most for pre-shaping a grasp.
@@ -114,9 +119,8 @@ REFERENCE_TERM_FUNCS = (
 # 1.07 m/s spawned envs travelling 2.6x faster than anything the motion ever does, and ~15x the median. That is
 # not initial-state diversity, it is noise unrelated to the task.
 #
-# Kept as its own constant rather than aliased to the push range: the two happen to coincide now, but they
-# answer different questions (how varied a start, versus how hard a shove) and should stay independently
-# tunable.
+# Deliberately not the push range below, which is back at BeyondMimic's +-0.7/0.7/0.4: a push lands on a robot
+# already tracking the clip and tests recovery, whereas this sets the starting state itself.
 VELOCITY_RANGE = {
     "x": (-0.3, 0.3),
     "y": (-0.3, 0.3),
@@ -126,16 +130,17 @@ VELOCITY_RANGE = {
     "yaw": (-0.3, 0.3),
 }
 
-# Push disturbance. Max magnitude 0.43 m/s and 0.41 rad/s, against 1.07 and 1.34 under the old range -- 2.5x
-# smaller linearly, 3.2x angularly, with the vertical kick 8x smaller. The old range was breaking grasps rather
-# than teaching recovery.
+# Push disturbance: BeyondMimic's range (beyond_mimic/.../largebox_tracker), max magnitude 1.07 m/s and 1.34
+# rad/s. It was once cut to +-0.3/0.3/0.05 m/s because it broke grasps, but that policy then failed grasps and
+# lost balance on hardware. With the 75-step LOST_CONTACT_STEPS / OBJECT_ORI_STEPS window a broken grasp is now
+# something to recover from rather than an instant reset.
 PUSH_VELOCITY_RANGE = {
-    "x": (-0.3, 0.3),
-    "y": (-0.3, 0.3),
-    "z": (-0.05, 0.05),
-    "roll": (-0.2, 0.2),
-    "pitch": (-0.2, 0.2),
-    "yaw": (-0.3, 0.3),
+    "x": (-0.7, 0.7),
+    "y": (-0.7, 0.7),
+    "z": (-0.4, 0.4),
+    "roll": (-0.7, 0.7),
+    "pitch": (-0.7, 0.7),
+    "yaw": (-0.9, 0.9),
 }
 
 
@@ -325,6 +330,19 @@ class EventCfg:
         },
     )
 
+    # The URDF Trunk is 6.5 of the K1's 19.67 kg, so +-3 kg spans a 3.5-9.5 kg trunk: +-46% of the body, +-15% of
+    # the robot. Inertia is rescaled with it, uniform-density, as for object_mass.
+    base_mass = EventTerm(
+        func=mdp.randomize_rigid_body_mass,
+        mode="startup",
+        params={
+            "asset_cfg": SceneEntityCfg("robot", body_names="Trunk"),
+            "mass_distribution_params": (-3.0, 3.0),
+            "operation": "add",
+            "recompute_inertia": True,
+        },
+    )
+
     # -- object dynamics --
     #
     # Startup, not reset: each env keeps its draw for the whole run. This matches the robot's
@@ -391,13 +409,12 @@ class EventCfg:
     # events.py:1069 does ``vel_w += sample_uniform(...)``, so the sample lands on top of whatever the trunk is
     # already doing rather than replacing it. A push therefore perturbs momentum instead of erasing it.
     #
-    # EventManager resamples each env's timer at reset and again after each push, so the first push arrives 3-6 s
-    # in and an episode ending before 3 s is never pushed at all. A full 10 s episode now sees ~1.8 pushes against
-    # ~4.5 under (1.0, 3.0).
+    # EventManager resamples each env's timer at reset and again after each push, so the first push arrives 1-3 s
+    # in and a full 10 s episode sees ~4.5 pushes (BeyondMimic's interval; ~1.8 under the previous (3.0, 6.0)).
     push_robot = EventTerm(
         func=mdp.push_by_setting_velocity,
         mode="interval",
-        interval_range_s=(3.0, 6.0),
+        interval_range_s=(1.0, 3.0),
         params={"velocity_range": PUSH_VELOCITY_RANGE},
     )
 
@@ -452,6 +469,12 @@ class RewardsCfg:
         weight=-20.0,
         params={"asset_cfg": SceneEntityCfg("robot", joint_names=[".*"])},
     )
+    # Every non-timeout termination (falls, ee_body_pos, object, lost_contact). Weights are scaled by step_dt, so
+    # this is a one-off -10 -- about 3 steps of the ~+3.2 net per-step reward the 9k fine-tune earns. Dying already
+    # forfeits ~300 of discounted return (gamma 0.99), so this only marks the failure step and covers states where
+    # tracking has collapsed and the reward runs near zero. Kept modest: large terminal penalties make a policy
+    # risk-averse and stiff, and the deployed motion is already over-damped. (hoi_mimic's -50 would be -1 here.)
+    termination = RewTerm(func=mdp.is_terminated, weight=-500.0)
     # ULTRA's effort and smoothness regularizers. torque_l2 and energy read the applied torque; torque_limit reads
     # the pre-clip PD torque, since the applied one is clipped to the limit and would cap the term at 0.05 per
     # joint. The two *_change terms are per 50 Hz control step, and score zero on the first step after a reset.

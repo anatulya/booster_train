@@ -50,6 +50,14 @@ parser.add_argument(
     help="Disable the manipulated object's startup domain randomization (mass, friction/restitution, inertia"
     " scale, CoM), e.g. to render against the nominal object. Ignored by tasks with no such events.",
 )
+parser.add_argument(
+    "--enable_pushes",
+    action="store_true",
+    default=False,
+    help="Re-enable the push_robot event that -Play configs disable for clean rendering, copying it verbatim"
+    " from the non-Play (training) task so the push magnitude/interval always matches what the policy trained"
+    " against. Ignored by tasks with no push_robot event.",
+)
 # append RSL-RL cli arguments
 cli_args.add_rsl_rl_args(parser)
 # append AppLauncher cli args
@@ -90,7 +98,7 @@ from isaaclab_rl.utils.pretrained_checkpoint import get_published_pretrained_che
 from isaaclab_rl.rsl_rl import RslRlOnPolicyRunnerCfg, RslRlVecEnvWrapper, export_policy_as_jit, export_policy_as_onnx
 
 import isaaclab_tasks  # noqa: F401
-from isaaclab_tasks.utils import get_checkpoint_path
+from isaaclab_tasks.utils import get_checkpoint_path, load_cfg_from_registry
 from isaaclab_tasks.utils.hydra import hydra_task_config
 
 import booster_train.tasks  # noqa: F401
@@ -132,6 +140,18 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             print(f"[INFO] --disable_object_dr: disabled event terms {disabled}")
         else:
             print(f"[WARN] --disable_object_dr ignored: {args_cli.task} has no object DR event terms.")
+
+    if args_cli.enable_pushes:
+        train_env_cfg = load_cfg_from_registry(train_task_name, "env_cfg_entry_point")
+        push_cfg = getattr(getattr(train_env_cfg, "events", None), "push_robot", None)
+        if push_cfg is not None:
+            env_cfg.events.push_robot = push_cfg
+            print(
+                f"[INFO] --enable_pushes: restored push_robot from {train_task_name} "
+                f"(interval {push_cfg.interval_range_s}, range {push_cfg.params['velocity_range']})"
+            )
+        else:
+            print(f"[WARN] --enable_pushes ignored: {train_task_name} has no push_robot event.")
 
     # specify directory for logging experiments
     log_root_path = os.path.join("logs", "rsl_rl", agent_cfg.experiment_name)
