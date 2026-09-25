@@ -25,6 +25,7 @@ class PlayFlatAsymEnvCfg(FlatAsymEnvCfg):
         # In play mode each env starts at the first frame of a different clip, so one run shows every motion.
         self.commands.motion.play = True
         self.events.push_robot = None
+        self.events.push_object = None
         # The actor group carries observation noise during training. Leaving it on here would make a render
         # show the noise as much as the policy, and would make repeated rollouts non-comparable.
         self.observations.policy.enable_corruption = False

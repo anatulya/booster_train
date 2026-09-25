@@ -54,9 +54,9 @@ parser.add_argument(
     "--enable_pushes",
     action="store_true",
     default=False,
-    help="Re-enable the push_robot event that -Play configs disable for clean rendering, copying it verbatim"
-    " from the non-Play (training) task so the push magnitude/interval always matches what the policy trained"
-    " against. Ignored by tasks with no push_robot event.",
+    help="Re-enable the push events (push_robot, and push_object where the task has one) that -Play configs"
+    " disable for clean rendering, copying each verbatim from the non-Play (training) task so the push"
+    " magnitude/interval always matches what the policy trained against. Ignored by tasks with no push events.",
 )
 # append RSL-RL cli arguments
 cli_args.add_rsl_rl_args(parser)
@@ -142,16 +142,19 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             print(f"[WARN] --disable_object_dr ignored: {args_cli.task} has no object DR event terms.")
 
     if args_cli.enable_pushes:
-        train_env_cfg = load_cfg_from_registry(train_task_name, "env_cfg_entry_point")
-        push_cfg = getattr(getattr(train_env_cfg, "events", None), "push_robot", None)
-        if push_cfg is not None:
-            env_cfg.events.push_robot = push_cfg
-            print(
-                f"[INFO] --enable_pushes: restored push_robot from {train_task_name} "
-                f"(interval {push_cfg.interval_range_s}, range {push_cfg.params['velocity_range']})"
-            )
-        else:
-            print(f"[WARN] --enable_pushes ignored: {train_task_name} has no push_robot event.")
+        train_events = getattr(load_cfg_from_registry(train_task_name, "env_cfg_entry_point"), "events", None)
+        restored = []
+        for name in ("push_robot", "push_object"):
+            push_cfg = getattr(train_events, name, None)
+            if push_cfg is not None:
+                setattr(env_cfg.events, name, push_cfg)
+                restored.append(name)
+                print(
+                    f"[INFO] --enable_pushes: restored {name} from {train_task_name} "
+                    f"(interval {push_cfg.interval_range_s}, range {push_cfg.params['velocity_range']})"
+                )
+        if not restored:
+            print(f"[WARN] --enable_pushes ignored: {train_task_name} has no push events.")
 
     # specify directory for logging experiments
     log_root_path = os.path.join("logs", "rsl_rl", agent_cfg.experiment_name)

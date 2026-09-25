@@ -179,6 +179,7 @@ class PlayFlatRefOnlyEnvCfg(FlatRefOnlyEnvCfg):
         super().__post_init__()
         self.commands.motion.play = True
         self.events.push_robot = None
+        self.events.push_object = None
 
 
 @configclass
@@ -188,6 +189,7 @@ class PlayFlatWoStateEstimationEnvCfg(FlatWoStateEstimationEnvCfg):
         # In play mode each env starts at the first frame of a different clip, so one run shows every motion.
         self.commands.motion.play = True
         self.events.push_robot = None
+        self.events.push_object = None
 
 
 # ---- Single-clip variants, for overfitting one policy per sequence ----------------------------------------------

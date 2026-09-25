@@ -5,8 +5,10 @@ from typing import TYPE_CHECKING, Literal
 
 import isaaclab.utils.math as math_utils
 from isaaclab.assets import Articulation, RigidObject
-from isaaclab.envs.mdp.events import _randomize_prop_by_op
+from isaaclab.envs.mdp.events import _randomize_prop_by_op, push_by_setting_velocity
 from isaaclab.managers import SceneEntityCfg
+
+from booster_train.tasks.manager_based.hoi_track.mdp.rewards import hand_object_normal_force
 
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedEnv
@@ -213,3 +215,29 @@ def randomize_rigid_object_material_with_ratio(
     materials = asset.root_physx_view.get_material_properties()
     materials[env_ids] = material_buckets[bucket_ids]
     asset.root_physx_view.set_material_properties(materials, env_ids)
+
+
+def push_object_during_contact(
+    env: ManagerBasedEnv,
+    env_ids: torch.Tensor,
+    command_name: str,
+    contact_sensor_names: list[str],
+    force_threshold: float,
+    velocity_range: dict[str, tuple[float, float]],
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("object"),
+):
+    """Kick the object's velocity, but only while the policy is actually holding it as the reference asks.
+
+    An env is pushed when every hand the reference labels in contact reads at least ``force_threshold`` against
+    the object, and at least one hand is labelled. Outside grasp windows a push would just move a box nobody is
+    holding; with a hand missing the grasp has already failed, which LostContact deals with. A timer that fires
+    while this gate is closed is skipped, not deferred.
+
+    A velocity kick rather than a force impulse, so its effect does not scale with the randomized object mass.
+    """
+    command = env.command_manager.get_term(command_name)
+    ref = command.ref_contact[env_ids] > 0.5
+    held = hand_object_normal_force(env, contact_sensor_names, reduce="last")[env_ids] >= force_threshold
+    gate = ref.any(dim=-1) & (held | ~ref).all(dim=-1)
+    if gate.any():
+        push_by_setting_velocity(env, env_ids[gate], velocity_range, asset_cfg)

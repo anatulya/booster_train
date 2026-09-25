@@ -45,11 +45,17 @@ HAND_CONTACT_FORCE_THRESHOLD = 0.1
 #
 # The previous 0.1 / 1.0 pair made this a near-gate rather than a shaped reward: a hand at zero force scored
 # exp(-2/1) = 0.135, and at the 25k run's measured 0.158 m gated palm distance r_int scored 0.400. Their
-# product left almost no gradient during the approach, which is the phase that needs it most. At 10/40 the
-# force factor instead spans only 0.779 to 1.0, so force nudges and position shapes.
-CONTACT_REWARD_FORCE_THRESHOLD = 10.0
+# product left almost no gradient during the approach, which is the phase that needs it most. At HDMI's 10/40
+# the force factor instead spans only 0.779 to 1.0, so force nudges and position shapes.
+#
+# Now 20 / 30, off HDMI's 10 / 40, to ask for a harder squeeze: the hands clear 10 N easily (sub3 averaged ~34 N
+# over its gated frames) and the grasp still slips on hardware. The factor is 0.51 at zero force, 0.72 at 10 N and
+# 1.0 from 20 N -- still a shaped term rather than the old near-gate, but the ramp now runs to 20 N instead of
+# stopping at 10. Interaction/r_F reads lower than before at the same force; that is the new scale, not a
+# regression.
+CONTACT_REWARD_FORCE_THRESHOLD = 20.0
 CONTACT_SIGMA_P = 0.3
-CONTACT_SIGMA_F = 40.0
+CONTACT_SIGMA_F = 30.0
 # Scales only the gated part of the interaction reward. Without it a single weight sets both the grasping
 # gradient and the flat (1 - gate) survival constant, and the constant wins: at 25k iterations 9.24 of the
 # 10.05 earned was the constant and 0.83 was grasping. At gain 5 the gated-frame weight becomes 100 against
@@ -141,6 +147,15 @@ PUSH_VELOCITY_RANGE = {
     "roll": (-0.7, 0.7),
     "pitch": (-0.7, 0.7),
     "yaw": (-0.9, 0.9),
+}
+
+# Velocity kick on the held object (push_object). Linear only: the grip turns a linear kick into some rotation
+# anyway, and injecting spin directly is not what a bumped or slipping box does. +-0.3 m/s is about the reference
+# box's own p90 speed (0.43 m/s), so it jolts a grasp without simply knocking the box out of the hands.
+OBJECT_PUSH_VELOCITY_RANGE = {
+    "x": (-0.3, 0.3),
+    "y": (-0.3, 0.3),
+    "z": (-0.15, 0.15),
 }
 
 
@@ -394,12 +409,14 @@ class EventCfg:
     )
 
     # randomize_rigid_body_com is Articulation-only (see mdp/events.py); the box needs the RigidObject form.
+    # +-5 cm, so the policy cannot rely on a centred CoM when balancing the box between two hands. Still inside
+    # every object: the tightest is smallbox, 6.35 cm half-height.
     object_com = EventTerm(
         func=mdp.randomize_rigid_object_com,
         mode="startup",
         params={
             "asset_cfg": SceneEntityCfg("object"),
-            "com_range": {"x": (-0.025, 0.025), "y": (-0.025, 0.025), "z": (-0.025, 0.025)},
+            "com_range": {"x": (-0.05, 0.05), "y": (-0.05, 0.05), "z": (-0.05, 0.05)},
         },
     )
 
@@ -416,6 +433,21 @@ class EventCfg:
         mode="interval",
         interval_range_s=(1.0, 3.0),
         params={"velocity_range": PUSH_VELOCITY_RANGE},
+    )
+
+    # Only fires while every hand the reference labels in contact is measured on the box (LOST_CONTACT_FORCE, the
+    # same "in contact" the termination uses); other firings are skipped. So it perturbs a held box, never a
+    # resting one, and roughly 2 pushes land per grasp window when the grip holds.
+    push_object = EventTerm(
+        func=mdp.push_object_during_contact,
+        mode="interval",
+        interval_range_s=(1.0, 3.0),
+        params={
+            "command_name": "motion",
+            "contact_sensor_names": HAND_CONTACT_SENSOR_NAMES,
+            "force_threshold": LOST_CONTACT_FORCE,
+            "velocity_range": OBJECT_PUSH_VELOCITY_RANGE,
+        },
     )
 
 
