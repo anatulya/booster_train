@@ -740,6 +740,8 @@ class TrackingEnvCfg(ManagerBasedRLEnvCfg):
 
     def __post_init__(self):
         """Post initialization."""
+        # Contact-gated object pushes are off for now; delete this line to turn them back on.
+        self.events.push_object = None
         # general settings
         self.decimation = 4
         self.episode_length_s = 10.0
