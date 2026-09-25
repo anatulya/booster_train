@@ -26,6 +26,10 @@ class PlayFlatAsymEnvCfg(FlatAsymEnvCfg):
         self.commands.motion.play = True
         self.events.push_robot = None
         self.events.push_object = None
+        self.events.object_scenario = None
+        # No reset jitter either: a re-placed robot would otherwise start each rollout with a random kick and offset.
+        self.commands.motion.velocity_range = {}
+        self.commands.motion.pose_range = {}
         # The actor group carries observation noise during training. Leaving it on here would make a render
         # show the noise as much as the policy, and would make repeated rollouts non-comparable.
         self.observations.policy.enable_corruption = False

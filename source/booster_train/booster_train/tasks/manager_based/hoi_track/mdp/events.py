@@ -1,17 +1,18 @@
 from __future__ import annotations
 
 import torch
+from collections.abc import Sequence
 from typing import TYPE_CHECKING, Literal
 
 import isaaclab.utils.math as math_utils
 from isaaclab.assets import Articulation, RigidObject
 from isaaclab.envs.mdp.events import _randomize_prop_by_op, push_by_setting_velocity
-from isaaclab.managers import SceneEntityCfg
+from isaaclab.managers import EventTermCfg, ManagerTermBase, SceneEntityCfg
 
 from booster_train.tasks.manager_based.hoi_track.mdp.rewards import hand_object_normal_force
 
 if TYPE_CHECKING:
-    from isaaclab.envs import ManagerBasedEnv
+    from isaaclab.envs import ManagerBasedEnv, ManagerBasedRLEnv
 
 
 def randomize_joint_default_pos(
@@ -241,3 +242,351 @@ def push_object_during_contact(
     gate = ref.any(dim=-1) & (held | ~ref).all(dim=-1)
     if gate.any():
         push_by_setting_velocity(env, env_ids[gate], velocity_range, asset_cfg)
+
+
+class ObjectScenario(ManagerTermBase):
+    r"""Deal each episode one of three object scenarios, and run the two that take the object away.
+
+    * ``0`` regular -- the task as it has always been. This term does nothing to it.
+    * ``1`` forced drop -- at a reference contact frame chosen at reset, a downward world-frame force of
+      :math:`k\,m\,g` pushes the box until the simulated hands have been off it for ``release_steps``
+      consecutive steps. Only then does the grasp count as dropped.
+    * ``2`` no object -- the box is parked ``park_offset`` above the env origin for the whole episode.
+
+    Scenarios 1 and 2 bypass adaptive sampling. The command calls :meth:`presample` right after its own bin
+    draw and before it places robot and box, and that overwrites the start frame. No-object episodes start
+    uniformly over all resettable frames. Drop episodes start uniformly over the resettable frames that
+    still have a drop frame ahead within one episode. Adaptive sampling is about where the *grasp* fails,
+    which says nothing about where these two should start. It would also pull drop starts toward failure-heavy
+    bins, which often sit after the last drop frame.
+
+    The drop frame is drawn from the reference alone, uniformly over the frames the episode can still reach:
+    from the start to the clip end or ``max_episode_length`` steps, whichever is sooner. It must be a frame
+    where the reference has a hand in contact *and* the box is lifted at least ``min_lift`` above that clip's
+    lowest box height. Waiting for simulated contact would under-sample exactly the grasps the policy is
+    still bad at. The lift filter keeps drops out of frames where the box already rests on the floor and a
+    push down does nothing.
+
+    ``drop_triggered`` only starts the force. ``grasp_dropped`` is set once contact is actually gone, and it
+    is what the rest of the task keys off, via ``env.object_absent = grasp_dropped | (scenario == 2)``:
+    object rewards are masked, object terminations are disabled, and the termination penalty applies only to
+    genuine falls. So a box the force fails to eject -- capped after ``max_force_s`` and logged as
+    ``Scenario/drop_cap_hit_frac`` -- leaves the episode running as a regular one.
+
+    Runs as an interval event with ``interval_range_s=(0, 0)``, i.e. once per control step. Its reset runs
+    after the command's, so the new start frame is known and the park write is not undone by the command
+    placing the box on the reference. Parking is re-written every step since a parked box would otherwise fall.
+
+    The flags are shared through ``env.object_scenario``, ``env.grasp_dropped`` and ``env.object_absent``,
+    written in place so the references stay valid.
+    """
+
+    REGULAR, DROP, NO_OBJECT = 0, 1, 2
+
+    def __init__(self, cfg: EventTermCfg, env: ManagerBasedRLEnv):
+        super().__init__(cfg, env)
+        n = self.num_envs
+        long = dict(dtype=torch.long, device=self.device)
+        flag = dict(dtype=torch.bool, device=self.device)
+        self.scenario = torch.zeros(n, **long)
+        self.drop_frame = torch.zeros(n, **long)
+        self.trigger_step = torch.zeros(n, **long)
+        self.release_step = torch.zeros(n, **long)
+        self.no_contact_steps = torch.zeros(n, **long)
+        self.drop_triggered = torch.zeros(n, **flag)
+        self.grasp_dropped = torch.zeros(n, **flag)
+        self.force_capped = torch.zeros(n, **flag)
+        self.object_absent = torch.zeros(n, **flag)
+        self.force_scale = torch.zeros(n, device=self.device)
+        self.next_scenario = torch.zeros(n, **long)
+        self.err_sums = {name: torch.zeros(n, device=self.device) for name in self.TRACKED_ERRORS}
+        self.err_counts = torch.zeros(n, device=self.device)
+
+        env.object_scenario = self.scenario
+        env.grasp_dropped = self.grasp_dropped
+        env.object_absent = self.object_absent
+        # MotionCommand calls presample() through this, so scenarios 1 and 2 can pick their own start frame.
+        env.object_scenario_sampler = self
+        self.presampled = torch.zeros(n, **flag)
+
+        probs = torch.tensor(cfg.params["probabilities"], dtype=torch.float, device=self.device)
+        self.probs = probs / probs.sum()
+        # Render / eval only: env i always runs fixed_scenarios[i % len], so one rollout shows every scenario.
+        fixed = cfg.params.get("fixed_scenarios")
+        self.fixed = None if fixed is None else torch.tensor(fixed, dtype=torch.long, device=self.device)
+        self.asset: RigidObject = env.scene[cfg.params.get("asset_cfg", SceneEntityCfg("object")).name]
+        # Built on first use: the command manager is created after the event manager.
+        self._eligible_cum: torch.Tensor | None = None
+        self._mass: torch.Tensor | None = None
+        self._force_written = False
+
+    def _setup(self, command) -> None:
+        motion = command.motion
+        clip_of_frame = torch.repeat_interleave(
+            torch.arange(motion.num_clips, device=self.device), motion.clip_lengths
+        )
+        z = motion.object_pos_w[:, 2]
+        clip_min = torch.full((motion.num_clips,), float("inf"), device=self.device)
+        clip_min = clip_min.scatter_reduce(0, clip_of_frame, z, reduce="amin")
+        lifted = z - clip_min[clip_of_frame] > self.cfg.params["min_lift"]
+        if motion.has_contact:
+            eligible = (motion.contact > 0.5).any(dim=-1) & lifted
+        else:
+            eligible = torch.zeros_like(lifted)
+        # cum[i] = number of eligible frames in [0, i), so [s, e) holds cum[e] - cum[s] of them.
+        self._eligible_cum = torch.cat(
+            [torch.zeros(1, dtype=torch.long, device=self.device), torch.cumsum(eligible.long(), dim=0)]
+        )
+
+        # Start-frame tables for the scenarios that skip adaptive sampling: every resettable frame, and the
+        # subset from which a drop frame is still reachable within one episode.
+        reset_lengths = motion.clip_reset_lengths
+        reset_clips = torch.repeat_interleave(torch.arange(motion.num_clips, device=self.device), reset_lengths)
+        offsets = torch.arange(len(reset_clips), device=self.device) - torch.repeat_interleave(
+            torch.cumsum(reset_lengths, dim=0) - reset_lengths, reset_lengths
+        )
+        reset_frames = motion.clip_starts[reset_clips] + offsets
+        reachable = self._drop_window_end(reset_frames, reset_clips, motion)
+        can_drop = self._eligible_cum[reachable] - self._eligible_cum[reset_frames] > 0
+        self._reset_frames, self._reset_clips = reset_frames, reset_clips
+        self._drop_start_frames, self._drop_start_clips = reset_frames[can_drop], reset_clips[can_drop]
+
+    def _drop_window_end(self, start: torch.Tensor, clip: torch.Tensor, motion) -> torch.Tensor:
+        """Exclusive end of the frames an episode starting at ``start`` can reach."""
+        return torch.minimum(motion.clip_ends[clip], start + int(self._env.max_episode_length))
+
+    def _deal(self, ids: torch.Tensor) -> torch.Tensor:
+        """Scenario for each of ``ids``: drawn from ``probabilities``, or fixed per env index in render / eval."""
+        if self.fixed is not None:
+            return self.fixed[ids % len(self.fixed)]
+        return torch.multinomial(self.probs, len(ids), replacement=True)
+
+    def presample(self, env_ids: Sequence[int], command) -> None:
+        """Deal the next episode's scenario and move non-regular starts off the adaptive draw.
+
+        Called by :class:`MotionCommand` after ``_adaptive_sampling`` has set ``time_steps`` / ``motion_ids``,
+        and before it writes the robot and object onto that frame.
+        """
+        ids = torch.as_tensor(env_ids, dtype=torch.long, device=self.device)
+        if len(ids) == 0:
+            return
+        if self._eligible_cum is None:
+            self._setup(command)
+        scenario = self._deal(ids)
+        if len(self._drop_start_frames) == 0:
+            scenario = torch.where(scenario == self.DROP, self.REGULAR, scenario)
+
+        for kind, frames, clips in (
+            (self.DROP, self._drop_start_frames, self._drop_start_clips),
+            (self.NO_OBJECT, self._reset_frames, self._reset_clips),
+        ):
+            mask = scenario == kind
+            if mask.any():
+                pick = torch.randint(len(frames), (int(mask.sum()),), device=self.device)
+                command.time_steps[ids[mask]] = frames[pick]
+                command.motion_ids[ids[mask]] = clips[pick]
+
+        self.next_scenario[ids] = scenario
+        self.presampled[ids] = True
+
+    def reset(self, env_ids: Sequence[int] | None = None) -> None:
+        params = self.cfg.params
+        if env_ids is None:
+            ids = torch.arange(self.num_envs, device=self.device)
+        else:
+            ids = torch.as_tensor(env_ids, dtype=torch.long, device=self.device)
+        if len(ids) == 0:
+            return
+        command = self._env.command_manager.get_term(params["command_name"])
+        if self._eligible_cum is None:
+            self._setup(command)
+
+        self._log(ids, params)
+
+        # -- the next episode's scenario: dealt by presample() when the command ran its adaptive draw, and
+        # drawn here otherwise (play mode, where starts are dealt deterministically and left alone).
+        presampled = self.presampled[ids]
+        scenario = torch.where(presampled, self.next_scenario[ids], self._deal(ids))
+        self.presampled[ids] = False
+        # -- and for drops, the frame: uniform over eligible frames this episode can still reach
+        cum = self._eligible_cum
+        start = command.time_steps[ids]
+        end = self._drop_window_end(start, command.motion_ids[ids], command.motion)
+        count = cum[end] - cum[start]
+        rank = torch.minimum((torch.rand(len(ids), device=self.device) * count).long(), (count - 1).clamp(min=0))
+        frame = torch.searchsorted(cum, (cum[start] + rank + 1).contiguous()) - 1
+        scenario = torch.where((scenario == self.DROP) & (count == 0), self.REGULAR, scenario)
+
+        lo, hi = params["force_scale_range"]
+        self.scenario[ids] = scenario
+        self.drop_frame[ids] = frame
+        log = self._env.extras.setdefault("log", {})
+        for kind, name in enumerate(self.SCENARIO_NAMES):
+            log[f"Scenario/{name}_share"] = (scenario == kind).float().mean()
+        self.force_scale[ids] = torch.rand(len(ids), device=self.device) * (hi - lo) + lo
+        self.trigger_step[ids] = 0
+        self.release_step[ids] = 0
+        self.no_contact_steps[ids] = 0
+        self.drop_triggered[ids] = False
+        self.grasp_dropped[ids] = False
+        self.force_capped[ids] = False
+        for err in self.TRACKED_ERRORS:
+            self.err_sums[err][ids] = 0.0
+        self.err_counts[ids] = 0.0
+        self._update_absent()
+        self._park(params["park_offset"])
+
+    # Tracking errors accumulated per scenario, from MotionCommand.metrics. Drops count only after the release,
+    # so the number describes tracking without the box rather than being diluted by the carry before it.
+    TRACKED_ERRORS = ("error_body_pos", "error_anchor_rot", "error_joint_pos")
+    SCENARIO_NAMES = ("regular", "drop", "noobj")
+
+    def _log(self, ids: torch.Tensor, params: dict) -> None:
+        """Per-scenario episode metrics under ``Scenario/``, logged in one batch per reset call.
+
+        Every scenario gets:
+        - ``share``: its fraction of the episodes *dealt* in this batch, logged from :meth:`reset`. Counting
+          the episodes that end would over-weight whichever scenario fails soonest.
+        - ``len_s``: episode length
+        - ``timeout_frac``, ``fell_frac`` (``fall_term_names``), ``ee_body_frac``
+        - tracking errors
+
+        For a drop, those are over episodes whose grasp was actually released, since that is the scenario
+        being trained; a drop that never released is a regular episode in all but name. Regular episodes also
+        get ``object_term_frac``, the baseline the other two no longer have. Drops add
+        ``triggered_frac`` / ``released_frac`` / ``cap_hit_frac`` for the mechanism itself, ``release_s``
+        (trigger to release) and ``post_drop_s`` (release to episode end).
+        """
+        env = self._env
+        scenario = self.scenario[ids]
+        terminations = env.termination_manager
+        active = terminations.active_terms
+
+        def any_term(names) -> torch.Tensor:
+            hit = torch.zeros(len(ids), dtype=torch.bool, device=self.device)
+            for name in names:
+                if name in active:
+                    hit |= terminations.get_term(name)[ids]
+            return hit
+
+        fell = any_term(params["fall_term_names"])
+        ee = any_term([params["ee_term_name"]])
+        object_term = any_term(params["object_term_names"])
+        timeout = terminations.time_outs[ids]
+        length_s = env.episode_length_buf[ids].float() * env.step_dt
+        counts = self.err_counts[ids]
+
+        log = env.extras.setdefault("log", {})
+        drop = scenario == self.DROP
+        released = self.grasp_dropped[ids]
+        groups = {
+            "regular": scenario == self.REGULAR,
+            "drop": released,
+            "noobj": scenario == self.NO_OBJECT,
+        }
+        for name in self.SCENARIO_NAMES:
+            mask = groups[name]
+            if not mask.any():
+                continue
+            log[f"Scenario/{name}_len_s"] = length_s[mask].mean()
+            log[f"Scenario/{name}_timeout_frac"] = timeout[mask].float().mean()
+            log[f"Scenario/{name}_fell_frac"] = fell[mask].float().mean()
+            log[f"Scenario/{name}_ee_body_frac"] = ee[mask].float().mean()
+            seen = mask & (counts > 0)
+            if seen.any():
+                for err in self.TRACKED_ERRORS:
+                    log[f"Scenario/{name}_{err}"] = (self.err_sums[err][ids][seen] / counts[seen]).mean()
+        if groups["regular"].any():
+            log["Scenario/regular_object_term_frac"] = object_term[groups["regular"]].float().mean()
+
+        if drop.any():
+            triggered = self.drop_triggered[ids] & drop
+            log["Scenario/drop_triggered_frac"] = triggered[drop].float().mean()
+            if triggered.any():
+                log["Scenario/drop_released_frac"] = released[triggered].float().mean()
+                log["Scenario/drop_cap_hit_frac"] = self.force_capped[ids][triggered].float().mean()
+            if released.any():
+                release_s = (self.release_step[ids] - self.trigger_step[ids]).float() * env.step_dt
+                log["Scenario/drop_release_s"] = release_s[released].mean()
+                post_drop = (env.episode_length_buf[ids] - self.release_step[ids]).float() * env.step_dt
+                log["Scenario/drop_post_drop_s"] = post_drop[released].mean()
+
+    def _update_absent(self) -> None:
+        torch.logical_or(self.grasp_dropped, self.scenario == self.NO_OBJECT, out=self.object_absent)
+
+    def _park(self, park_offset: tuple[float, float, float]) -> None:
+        ids = (self.scenario == self.NO_OBJECT).nonzero().flatten()
+        if len(ids) == 0:
+            return
+        offset = torch.tensor(park_offset, dtype=torch.float, device=self.device)
+        quat = torch.zeros(len(ids), 4, device=self.device)
+        quat[:, 0] = 1.0
+        pose = torch.cat([self._env.scene.env_origins[ids] + offset, quat], dim=-1)
+        self.asset.write_root_pose_to_sim(pose, env_ids=ids)
+        self.asset.write_root_velocity_to_sim(torch.zeros(len(ids), 6, device=self.device), env_ids=ids)
+
+    def _write_force(self, active: torch.Tensor) -> None:
+        any_active = bool(active.any())
+        if not any_active:
+            if self._force_written:
+                self.asset.permanent_wrench_composer.reset()
+                self._force_written = False
+            return
+        if self._mass is None:
+            # Read after the startup mass randomisation, which is why this is lazy.
+            self._mass = self.asset.root_physx_view.get_masses().to(self.device).view(self.num_envs, -1).sum(-1)
+        gravity = abs(self._env.sim.cfg.gravity[2])
+        forces = torch.zeros(self.num_envs, 1, 3, device=self.device)
+        forces[:, 0, 2] = -(active.float() * self.force_scale * self._mass * gravity)
+        self.asset.permanent_wrench_composer.set_forces_and_torques(
+            forces=forces, torques=torch.zeros_like(forces), is_global=True
+        )
+        self._force_written = True
+
+    def __call__(
+        self,
+        env: ManagerBasedRLEnv,
+        env_ids: torch.Tensor | None,
+        command_name: str,
+        contact_sensor_names: list[str],
+        force_threshold: float,
+        probabilities: tuple[float, float, float],
+        fixed_scenarios: tuple[int, ...] | None = None,
+        force_scale_range: tuple[float, float] = (2.0, 4.0),
+        release_steps: int = 5,
+        max_force_s: float = 1.0,
+        min_lift: float = 0.1,
+        park_offset: tuple[float, float, float] = (0.0, 0.0, 10.0),
+        fall_term_names: tuple[str, ...] = ("anchor_pos", "anchor_ori"),
+        ee_term_name: str = "ee_body_pos",
+        object_term_names: tuple[str, ...] = ("object_pos", "object_ori", "lost_contact"),
+        asset_cfg: SceneEntityCfg = SceneEntityCfg("object"),
+    ) -> None:
+        command = env.command_manager.get_term(command_name)
+        step = env.episode_length_buf
+
+        trigger = (self.scenario == self.DROP) & ~self.drop_triggered & (command.time_steps >= self.drop_frame)
+        self.drop_triggered |= trigger
+        self.trigger_step = torch.where(trigger, step, self.trigger_step)
+
+        pending = self.drop_triggered & ~self.grasp_dropped & ~self.force_capped
+        if pending.any():
+            held = (hand_object_normal_force(env, contact_sensor_names, reduce="last") >= force_threshold).any(dim=-1)
+            self.no_contact_steps = torch.where(
+                pending & ~held, self.no_contact_steps + 1, torch.zeros_like(self.no_contact_steps)
+            )
+            released = pending & (self.no_contact_steps >= release_steps)
+            self.grasp_dropped |= released
+            self.release_step = torch.where(released, step, self.release_step)
+            self.force_capped |= pending & ~released & ((step - self.trigger_step) * env.step_dt >= max_force_s)
+            pending &= ~self.grasp_dropped & ~self.force_capped
+
+        self._write_force(pending)
+        self._update_absent()
+        self._park(park_offset)
+
+        # Tracking errors: all of a regular or no-object episode, and a drop only once the box is gone.
+        counted = (self.scenario != self.DROP) | self.grasp_dropped
+        for err in self.TRACKED_ERRORS:
+            self.err_sums[err] += command.metrics[err] * counted
+        self.err_counts += counted.float()

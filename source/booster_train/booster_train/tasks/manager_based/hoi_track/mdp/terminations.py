@@ -14,7 +14,11 @@ from isaaclab.managers import ManagerTermBase, SceneEntityCfg, TerminationTermCf
 
 from booster_train.tasks.manager_based.hoi_track.mdp.commands import MotionCommand
 from booster_train.tasks.manager_based.hoi_track.mdp.geometry import quat_in_heading, rotate_into_heading
-from booster_train.tasks.manager_based.hoi_track.mdp.rewards import _get_body_indexes, hand_object_normal_force
+from booster_train.tasks.manager_based.hoi_track.mdp.rewards import (
+    _get_body_indexes,
+    _object_absent,
+    hand_object_normal_force,
+)
 
 
 def bad_anchor_pos(env: ManagerBasedRLEnv, command_name: str, threshold: float) -> torch.Tensor:
@@ -110,6 +114,9 @@ class BadObjectPos(ManagerTermBase):
         )
         rel_ref = rotate_into_heading(command.anchor_quat_w, command.object_pos_w - command.anchor_pos_w)
         bad = torch.norm(rel_now - rel_ref, dim=1) > threshold
+        absent = _object_absent(env)
+        if absent is not None:
+            bad &= ~absent
 
         self.bad_steps = torch.where(bad, self.bad_steps + 1, torch.zeros_like(self.bad_steps))
         return self.bad_steps > max_steps
@@ -157,6 +164,9 @@ class BadObjectOri(ManagerTermBase):
         rel_now = quat_in_heading(command.robot_anchor_quat_w, command.robot_object_quat_w)
         rel_ref = quat_in_heading(command.anchor_quat_w, command.object_quat_w)
         bad = math_utils.quat_error_magnitude(rel_now, rel_ref) > threshold
+        absent = _object_absent(env)
+        if absent is not None:
+            bad &= ~absent
 
         self.bad_steps = torch.where(bad, self.bad_steps + 1, torch.zeros_like(self.bad_steps))
         return self.bad_steps > max_steps
@@ -214,6 +224,9 @@ class LostContact(ManagerTermBase):
 
         force = hand_object_normal_force(env, contact_sensor_names, reduce="last")
         lost = (command.ref_contact > 0.5) & ((force < force_threshold) | (dist > distance_threshold))
+        absent = _object_absent(env)
+        if absent is not None:
+            lost &= ~absent[:, None]
 
         self.lost_steps = torch.where(lost, self.lost_steps + 1, torch.zeros_like(self.lost_steps))
         return (self.lost_steps > max_steps).any(dim=-1)

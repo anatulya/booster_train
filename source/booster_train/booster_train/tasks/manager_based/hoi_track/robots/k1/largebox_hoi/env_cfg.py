@@ -180,6 +180,10 @@ class PlayFlatRefOnlyEnvCfg(FlatRefOnlyEnvCfg):
         self.commands.motion.play = True
         self.events.push_robot = None
         self.events.push_object = None
+        self.events.object_scenario = None
+        # No reset jitter either: a re-placed robot would otherwise start each rollout with a random kick and offset.
+        self.commands.motion.velocity_range = {}
+        self.commands.motion.pose_range = {}
 
 
 @configclass
@@ -190,6 +194,10 @@ class PlayFlatWoStateEstimationEnvCfg(FlatWoStateEstimationEnvCfg):
         self.commands.motion.play = True
         self.events.push_robot = None
         self.events.push_object = None
+        self.events.object_scenario = None
+        # No reset jitter either: a re-placed robot would otherwise start each rollout with a random kick and offset.
+        self.commands.motion.velocity_range = {}
+        self.commands.motion.pose_range = {}
 
 
 # ---- Single-clip variants, for overfitting one policy per sequence ----------------------------------------------

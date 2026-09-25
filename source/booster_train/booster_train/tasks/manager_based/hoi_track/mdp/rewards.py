@@ -214,6 +214,39 @@ def _hand_object_contact_state(
     return (hand_object_normal_force(env, contact_sensor_names, reduce) > force_threshold).float()
 
 
+def _object_absent(env: ManagerBasedRLEnv) -> torch.Tensor | None:
+    """``env.object_absent`` from :class:`~.events.ObjectScenario`, or None when that term is not configured.
+
+    True where the object has been taken away on purpose: a forced drop the hands have actually let go of, or
+    an episode dealt without the object. Object rewards and object terminations mean nothing there.
+    """
+    return getattr(env, "object_absent", None)
+
+
+def _mask_absent(env: ManagerBasedRLEnv, reward: torch.Tensor) -> torch.Tensor:
+    absent = _object_absent(env)
+    return reward if absent is None else reward * (~absent).float()
+
+
+def is_terminated_penalized(
+    env: ManagerBasedRLEnv, absent_penalty_terms: tuple[str, ...] = ("anchor_pos", "anchor_ori")
+) -> torch.Tensor:
+    """``is_terminated``, except that where the object is absent only genuine falls are penalised.
+
+    With the object gone, object terminations cannot fire (they are masked), and ``ee_body_pos`` -- which
+    also checks hand height -- may trip on hands that have nothing left to hold while the robot stands fine,
+    so it ends the episode without the penalty. Episodes that still have the object are penalised as before.
+    """
+    terminated = env.termination_manager.terminated
+    absent = _object_absent(env)
+    if absent is None or not absent.any():
+        return terminated.float()
+    fell = torch.zeros_like(terminated)
+    for name in absent_penalty_terms:
+        fell |= env.termination_manager.get_term(name)
+    return torch.where(absent, fell, terminated).float()
+
+
 def motion_global_object_position_error_exp(
     env: ManagerBasedRLEnv, command_name: str, std: float | str
 ) -> torch.Tensor:
@@ -221,7 +254,7 @@ def motion_global_object_position_error_exp(
     command: MotionCommand = env.command_manager.get_term(command_name)
     error = torch.sum(torch.square(command.object_pos_w - command.robot_object_pos_w), dim=-1)
     std = _get_adaptive_sigma(env, std, error.mean())
-    return torch.exp(-error / std**2)
+    return _mask_absent(env, torch.exp(-error / std**2))
 
 
 def motion_global_object_orientation_error_exp(
@@ -231,7 +264,7 @@ def motion_global_object_orientation_error_exp(
     command: MotionCommand = env.command_manager.get_term(command_name)
     error = quat_error_magnitude(command.object_quat_w, command.robot_object_quat_w) ** 2
     std = _get_adaptive_sigma(env, std, error.mean())
-    return torch.exp(-error / std**2)
+    return _mask_absent(env, torch.exp(-error / std**2))
 
 
 def motion_global_object_linear_velocity_error_exp(
@@ -247,7 +280,7 @@ def motion_global_object_linear_velocity_error_exp(
     command: MotionCommand = env.command_manager.get_term(command_name)
     error = torch.sum(torch.square(command.object_lin_vel_w - command.robot_object_lin_vel_w), dim=-1)
     std = _get_adaptive_sigma(env, std, error.mean())
-    return torch.exp(-error / std**2)
+    return _mask_absent(env, torch.exp(-error / std**2))
 
 
 class HandObjectInteraction(ManagerTermBase):
@@ -334,6 +367,10 @@ class HandObjectInteraction(ManagerTermBase):
         r_f = torch.exp(torch.clamp(force - force_threshold, max=0.0) / sigma_f)
 
         gate = command.ref_contact  # (N, P), 0/1 from the capture
+        absent = _object_absent(env)
+        if absent is not None:
+            # No object, nothing to grasp: score it like a frame outside the grasp windows.
+            gate = gate * (~absent).float()[:, None]
         reward = (gate * (r_int * r_f) * gain + (1.0 - gate)).mean(dim=-1)
 
         # Episode means over the frames the gate is actually open. Deliberately un-gained, so a gain change

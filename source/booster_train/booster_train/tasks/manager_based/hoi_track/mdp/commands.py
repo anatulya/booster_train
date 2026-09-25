@@ -420,6 +420,11 @@ class MotionCommand(CommandTerm):
 
     def _adaptive_sampling(self, env_ids: Sequence[int]):
         episode_failed = self._env.termination_manager.terminated[env_ids]
+        scenario = getattr(self._env, "object_scenario", None)
+        if scenario is not None:
+            # Only regular episodes say anything about how hard a bin is: a fall after a forced drop or with
+            # no object is not a failure of the grasp that bin is sampled for.
+            episode_failed = episode_failed & (scenario[env_ids] == 0)
         if torch.any(episode_failed):
             current_bin_index = self.frame_to_bin[self.time_steps.clamp(0, self.motion.time_step_total - 1)]
             fail_bins = current_bin_index[env_ids][episode_failed]
@@ -478,6 +483,11 @@ class MotionCommand(CommandTerm):
             self.time_steps[ids] = self.motion.clip_starts[self.motion_ids[ids]]
         else:
             self._adaptive_sampling(env_ids)
+            # ObjectScenario, when configured, deals the next scenario here and gives drop / no-object episodes
+            # their own uniform start frame instead of the adaptive one.
+            sampler = getattr(self._env, "object_scenario_sampler", None)
+            if sampler is not None:
+                sampler.presample(env_ids, self)
 
         root_pos = self.body_pos_w[:, 0].clone()
         root_ori = self.body_quat_w[:, 0].clone()

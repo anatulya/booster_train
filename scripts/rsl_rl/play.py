@@ -58,6 +58,17 @@ parser.add_argument(
     " disable for clean rendering, copying each verbatim from the non-Play (training) task so the push"
     " magnitude/interval always matches what the policy trained against. Ignored by tasks with no push events.",
 )
+parser.add_argument(
+    "--scenario",
+    choices=("regular", "drop", "noobj", "mixed", "each"),
+    default="regular",
+    help="Object scenario to play. -Play configs run the regular task only; anything else restores"
+    " object_scenario from the non-Play (training) task, so the drop force, cap and release settings match"
+    " training, and overrides only which scenario each env gets. drop: every env has the box knocked out of"
+    " its hands at a reference contact frame. noobj: the box is parked out of the scene. mixed: the training"
+    " mix. each: env i runs scenario i mod 3 (regular, drop, noobj), so --num_envs 3 shows all three."
+    " Ignored by tasks with no object_scenario event.",
+)
 # append RSL-RL cli arguments
 cli_args.add_rsl_rl_args(parser)
 # append AppLauncher cli args
@@ -156,6 +167,24 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         if not restored:
             print(f"[WARN] --enable_pushes ignored: {train_task_name} has no push events.")
 
+    if args_cli.scenario != "regular":
+        train_cfg = getattr(getattr(load_cfg_from_registry(train_task_name, "env_cfg_entry_point"), "events", None),
+                            "object_scenario", None)
+        if train_cfg is None:
+            print(f"[WARN] --scenario ignored: {train_task_name} has no object_scenario event.")
+        else:
+            params = dict(train_cfg.params)
+            if args_cli.scenario == "each":
+                params["fixed_scenarios"] = (0, 1, 2)
+                # The camera below is placed in world coordinates; an env-anchored viewer would offset it.
+                env_cfg.viewer.origin_type = "world"
+            elif args_cli.scenario != "mixed":
+                params["probabilities"] = {"drop": (0.0, 1.0, 0.0), "noobj": (0.0, 0.0, 1.0)}[args_cli.scenario]
+            env_cfg.events.object_scenario = train_cfg.replace(params=params)
+            print(f"[INFO] --scenario {args_cli.scenario}: restored object_scenario from {train_task_name} "
+                  f"(probabilities {params['probabilities']}, fixed {params.get('fixed_scenarios')}, "
+                  f"force x{params['force_scale_range']}, cap {params['max_force_s']} s)")
+
     # specify directory for logging experiments
     log_root_path = os.path.join("logs", "rsl_rl", agent_cfg.experiment_name)
     log_root_path = os.path.abspath(log_root_path)
@@ -243,6 +272,44 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     if version("rsl-rl-lib").startswith("2.3."):
         obs, _ = obs
     timestep = 0
+
+    # Frame all three scenario envs at once: the default view is a close-up of env 0 that hides the others.
+    if args_cli.scenario == "each" and hasattr(env.unwrapped, "viewport_camera_controller"):
+        origins = env.unwrapped.scene.env_origins[:3]
+        centre = origins.mean(dim=0)
+        env.unwrapped.viewport_camera_controller.update_view_location(
+            eye=(centre + torch.tensor([0.0, -5.0, 5.0], device=centre.device)).tolist(),
+            lookat=(centre + torch.tensor([0.0, 0.0, 0.0], device=centre.device)).tolist(),
+        )
+
+    # Scenario report: what each env was dealt, then when its drop starts and when the grasp is released, in
+    # rollout steps. Frames are clip-relative, so they line up with the reference motion.
+    scenario_term = None
+    if args_cli.scenario != "regular":
+        scenario_cfg = env.unwrapped.event_manager.get_term_cfg("object_scenario") if (
+            "object_scenario" in env.unwrapped.event_manager.active_terms.get("interval", [])
+        ) else None
+        scenario_term = scenario_cfg.func if scenario_cfg is not None else None
+    if scenario_term is not None:
+        names = scenario_term.SCENARIO_NAMES
+        motion = env.unwrapped.command_manager.get_term("motion")
+        clip_start = motion.motion.clip_starts[motion.motion_ids]
+        for i in range(min(env.unwrapped.num_envs, 16)):
+            line = f"[SCENARIO] env {i}: {names[int(scenario_term.scenario[i])]}"
+            if int(scenario_term.scenario[i]) == scenario_term.DROP:
+                line += f", drop at clip frame {int(scenario_term.drop_frame[i] - clip_start[i])}"
+            print(line)
+        seen = {k: getattr(scenario_term, k).clone() for k in ("drop_triggered", "grasp_dropped", "force_capped")}
+        step_count = 0
+        terminations = env.unwrapped.termination_manager
+
+        def describe(i: int) -> str:
+            kind = int(scenario_term.scenario[i])
+            text = names[kind]
+            if kind == scenario_term.DROP:
+                text += f", drop at clip frame {int(scenario_term.drop_frame[i] - motion.motion.clip_starts[motion.motion_ids[i]])}"
+            return text
+
     # simulate environment
     while simulation_app.is_running():
         start_time = time.time()
@@ -252,6 +319,21 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             actions = policy(obs)
             # env stepping
             obs, _, _, _ = env.step(actions)
+        if scenario_term is not None:
+            step_count += 1
+            # Episode ends come first, so a flag cleared by the reset is not reported as a fresh event below.
+            for i in terminations.dones.nonzero().flatten().tolist():
+                if i < 16:
+                    ended = [n for n in terminations.active_terms if bool(terminations.get_term(n)[i])]
+                    print(f"[SCENARIO] step {step_count}: env {i} episode ended on {ended or ['time_out']}; "
+                          f"next: {describe(i)}")
+            for key, label in (("drop_triggered", "force on"), ("grasp_dropped", "released"),
+                               ("force_capped", "force capped, grip held")):
+                now = getattr(scenario_term, key)
+                for i in (now & ~seen[key]).nonzero().flatten().tolist():
+                    if i < 16:
+                        print(f"[SCENARIO] step {step_count}: env {i} {label}")
+                seen[key] = now.clone()
         if args_cli.video:
             timestep += 1
             # Exit the play loop after recording one video

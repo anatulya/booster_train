@@ -48,19 +48,18 @@ HAND_CONTACT_FORCE_THRESHOLD = 0.1
 # product left almost no gradient during the approach, which is the phase that needs it most. At HDMI's 10/40
 # the force factor instead spans only 0.779 to 1.0, so force nudges and position shapes.
 #
-# Now 20 / 30, off HDMI's 10 / 40, to ask for a harder squeeze: the hands clear 10 N easily (sub3 averaged ~34 N
-# over its gated frames) and the grasp still slips on hardware. The factor is 0.51 at zero force, 0.72 at 10 N and
-# 1.0 from 20 N -- still a shaped term rather than the old near-gate, but the ramp now runs to 20 N instead of
-# stopping at 10. Interaction/r_F reads lower than before at the same force; that is the new scale, not a
-# regression.
-CONTACT_REWARD_FORCE_THRESHOLD = 20.0
+# A harder force landscape (20 N / sigma 30) was tried and did not raise force: on sub1_suitcase_029 r_F fell
+# 0.84 -> 0.61 and gated contact 22% -> 13%, with force flat at ~5 N. Back to HDMI's 10 / 40; the push for more
+# grip now comes from CONTACT_GAIN instead.
+CONTACT_REWARD_FORCE_THRESHOLD = 10.0
 CONTACT_SIGMA_P = 0.3
-CONTACT_SIGMA_F = 30.0
+CONTACT_SIGMA_F = 40.0
 # Scales only the gated part of the interaction reward. Without it a single weight sets both the grasping
 # gradient and the flat (1 - gate) survival constant, and the constant wins: at 25k iterations 9.24 of the
-# 10.05 earned was the constant and 0.83 was grasping. At gain 5 the gated-frame weight becomes 100 against
-# 139 for all body tracking combined -- close to HDMI, which runs grasping at 1:1 with its tracking group.
-CONTACT_GAIN = 5.0
+# 10.05 earned was the constant and 0.83 was grasping. Still true at gain 5: ~80% of the term was the constant
+# and grasping was ~6% of all reward. Gain 10 doubles the grasp gradient (position and force alike) without
+# touching the constant: gated frames now weigh 25 * 10 = 250 against ~145 for all body tracking.
+CONTACT_GAIN = 10.0
 
 # Early termination. LOST_CONTACT_FORCE / _DISTANCE are HDMI's cum_lost_contact_steps values (hdmi-base.yaml:269),
 # and the force bound stays far below the reward's grip threshold on purpose: between 1 N and CONTACT_REWARD_-
@@ -157,6 +156,34 @@ OBJECT_PUSH_VELOCITY_RANGE = {
     "y": (-0.3, 0.3),
     "z": (-0.15, 0.15),
 }
+
+# Object scenarios (ObjectScenario): regular / forced drop / no object. The last two teach the policy to finish
+# the motion upright when the box is gone -- a slipped grasp on hardware, or nothing to pick up -- instead of
+# learning that losing the box is the end of the episode. With the object gone its rewards are masked, its
+# terminations are off, and only anchor_pos / anchor_ori carry the termination penalty.
+OBJECT_SCENARIO_PROBS = (0.7, 0.2, 0.1)
+# Downward push while the drop is pending, as a multiple of the box's own (randomized) weight. It runs until no
+# hand has read LOST_CONTACT_FORCE for GRASP_DROP_RELEASE_STEPS steps, and only then is the grasp counted as
+# dropped. A grip still holding after GRASP_DROP_MAX_FORCE_S keeps the box and the episode stays regular.
+#
+# 3-5 x / 1.5 s from a sweep with the sub1_suitcase_029 asym policy, ~145 drops per config. The grip outlasted
+# the force on 17% of drops at 2-4 x / 1.0 s, against 6.9% at 3-5 x / 1.0 s, 5.6% at 2-4 x / 1.5 s and 5.6% at
+# 3-5 x / 1.5 s. The last also releases fastest (median 0.12 s, p90 0.70 s), so the drop lands close to its frame.
+GRASP_DROP_FORCE_SCALE = (3.0, 5.0)
+GRASP_DROP_RELEASE_STEPS = 5
+GRASP_DROP_MAX_FORCE_S = 1.5
+# Drop frames are reference contact frames with the box at least this far above its lowest point in the clip,
+# so the push never lands on a box already resting on the floor.
+GRASP_DROP_MIN_LIFT = 0.10
+# Where a no-object episode keeps the box: above its own env, clear of the ground plane and the neighbours.
+NO_OBJECT_PARK_OFFSET = (0.0, 0.0, 10.0)
+
+# Ground friction, randomized through the feet. The ground is one plane shared by every env, so its own material
+# cannot vary per env -- but it is 1.0 with friction_combine_mode="multiply", and PhysX uses the higher-priority
+# combine mode of the pair (multiply outranks the robot's default average). The contact friction is therefore
+# foot friction x 1.0, and sampling the feet samples the floor. Before this the feet shared physics_material's
+# 0.3-0.6 with every other body, so the effective floor was that range, not 1.0.
+GROUND_FRICTION_RANGE = (0.5, 2.0)
 
 
 @configclass
@@ -325,6 +352,23 @@ class EventCfg:
         },
     )
 
+    # Must follow physics_material, which it overrides on the feet; see GROUND_FRICTION_RANGE. make_consistent
+    # clamps dynamic <= static, which pulls dynamic friction toward the low end (mean ~1.0 rather than 1.25) and
+    # leaves static -- what decides whether a foot slips at all -- uniform. Restitution 0 is explicit only: the
+    # ground's is 0, multiply-combined too.
+    foot_physics_material = EventTerm(
+        func=mdp.randomize_rigid_body_material,
+        mode="startup",
+        params={
+            "asset_cfg": SceneEntityCfg("robot", body_names=["left_foot_link", "right_foot_link"]),
+            "static_friction_range": GROUND_FRICTION_RANGE,
+            "dynamic_friction_range": GROUND_FRICTION_RANGE,
+            "restitution_range": (0.0, 0.0),
+            "num_buckets": 64,
+            "make_consistent": True,
+        },
+    )
+
     add_joint_default_pos = EventTerm(
         func=mdp.randomize_joint_default_pos,
         mode="startup",
@@ -450,6 +494,27 @@ class EventCfg:
         },
     )
 
+    # Every control step: interval_range_s=(0, 0) fires on each call. See ObjectScenario and the constants above.
+    object_scenario = EventTerm(
+        func=mdp.ObjectScenario,
+        mode="interval",
+        interval_range_s=(0.0, 0.0),
+        params={
+            "command_name": "motion",
+            "contact_sensor_names": HAND_CONTACT_SENSOR_NAMES,
+            "force_threshold": LOST_CONTACT_FORCE,
+            "probabilities": OBJECT_SCENARIO_PROBS,
+            "force_scale_range": GRASP_DROP_FORCE_SCALE,
+            "release_steps": GRASP_DROP_RELEASE_STEPS,
+            "max_force_s": GRASP_DROP_MAX_FORCE_S,
+            "min_lift": GRASP_DROP_MIN_LIFT,
+            "park_offset": NO_OBJECT_PARK_OFFSET,
+            "fall_term_names": ("anchor_pos", "anchor_ori"),
+            "ee_term_name": "ee_body_pos",
+            "object_term_names": ("object_pos", "object_ori", "lost_contact"),
+        },
+    )
+
 
 @configclass
 class RewardsCfg:
@@ -506,7 +571,14 @@ class RewardsCfg:
     # forfeits ~300 of discounted return (gamma 0.99), so this only marks the failure step and covers states where
     # tracking has collapsed and the reward runs near zero. Kept modest: large terminal penalties make a policy
     # risk-averse and stiff, and the deployed motion is already over-damped. (hoi_mimic's -50 would be -1 here.)
-    termination = RewTerm(func=mdp.is_terminated, weight=-500.0)
+    #
+    # Where ObjectScenario has taken the object away, only anchor_pos / anchor_ori are penalised: ee_body_pos
+    # also reads hand height, which can drift with nothing left to hold while the robot stands fine.
+    termination = RewTerm(
+        func=mdp.is_terminated_penalized,
+        weight=-500.0,
+        params={"absent_penalty_terms": ("anchor_pos", "anchor_ori")},
+    )
     # ULTRA's effort and smoothness regularizers. torque_l2 and energy read the applied torque; torque_limit reads
     # the pre-clip PD torque, since the applied one is clipped to the limit and would cap the term at 0.05 per
     # joint. The two *_change terms are per 50 Hz control step, and score zero on the first step after a reset.
