@@ -627,44 +627,58 @@ class RewardsCfg:
     )
     # ULTRA's foot terms; the weights are ours. The clips' feet are not flat -- sub3_largebox_003 holds them
     # rolled ~22 deg onto their edges through the final hold, a retargeting artifact -- and feet_orientation pulls
-    # them flat anyway. It only has to beat the loose motion_foot_tilt below, not a stiff full-orientation term:
-    # against the old motion_foot_ori (15, std 0.2) a -10 penalty bought ~1 deg of flattening. Expected balance
-    # at -20 against tilt (5, std 0.5) is ~12 of ~18 deg flattened; lower motion_foot_tilt's weight for more.
-    feet_orientation = RewTerm(
-        func=mdp.feet_orientation_l2,
-        weight=-20.0,
-        params={"asset_cfg": SceneEntityCfg("robot", body_names=["left_foot_link", "right_foot_link"])},
-    )
-    feet_stumble = RewTerm(
-        func=mdp.feet_stumble,
-        weight=-10.0,
-        params={
-            "sensor_cfg": SceneEntityCfg("contact_forces", body_names=["left_foot_link", "right_foot_link"]),
-            "ratio": 4.0,
-        },
-    )
+    # them flat anyway. How far it gets depends on the orientation term it fights: against a full-orientation
+    # motion_foot_ori (15, std 0.2) a -10 penalty bought ~1 deg of flattening, while against the split's loose
+    # tilt (5, std 0.5) -20 was expected to flatten ~12 of ~18 deg. motion_foot_ori is back at 20 / std 0.2, so
+    # expect the feet to follow the clip's roll again; restore the split below to flatten them.
+    #
+    # Off for now, with motion_foot_ori back at full strength the two would only fight. Kept for reference; replace
+    # the None with this (and restore the split) to flatten the feet again.
+    # feet_orientation = RewTerm(
+    #     func=mdp.feet_orientation_l2,
+    #     weight=-20.0,
+    #     params={"asset_cfg": SceneEntityCfg("robot", body_names=["left_foot_link", "right_foot_link"])},
+    # )
+    feet_orientation = None
+    # Off. Kept for reference; replace the None with this to turn it back on.
+    # feet_stumble = RewTerm(
+    #     func=mdp.feet_stumble,
+    #     weight=-10.0,
+    #     params={
+    #         "sensor_cfg": SceneEntityCfg("contact_forces", body_names=["left_foot_link", "right_foot_link"]),
+    #         "ratio": 4.0,
+    #     },
+    # )
+    feet_stumble = None
     # Off for the HOI task. It penalises contact on every body but the feet, using the *unfiltered*
     # contact_forces sensor, so a hand pressing on the object earns the interaction reward and is fined -10 for
     # touching anything at the same time -- the two terms directly cancel. Re-enable with the hands excluded
     # from body_names if the robot needs a penalty for faceplanting.
     undesired_contacts = None
-    # Foot orientation, split in two. Heading is tracked as tightly as the old full-orientation term was; tilt only
-    # loosely (std 0.5 rad, ~29 deg), as a guard against feet wildly off the clip rather than a hold on the
-    # clip's rolled feet -- see feet_orientation above.
-    motion_foot_yaw = RewTerm(
-        func=mdp.motion_relative_body_yaw_error_exp,
-        weight=15.0,
+    # Foot orientation and position, both at 20: back to the tracker's single full-orientation term (std 0.2),
+    # between largebox_tracker's 15 (ori) / 30 (pos) and this task's previous 15 / 15.
+    motion_foot_ori = RewTerm(
+        func=mdp.motion_relative_body_orientation_error_exp,
+        weight=20.0,
         params={"command_name": "motion", "std": 0.2, "body_names": ["left_foot_link", "right_foot_link"]},
     )
-    motion_foot_tilt = RewTerm(
-        func=mdp.motion_relative_body_tilt_error_exp,
-        weight=5.0,
-        params={"command_name": "motion", "std": 0.5, "body_names": ["left_foot_link", "right_foot_link"]},
-    )
+    # Previous split, kept for reference: heading tracked as tightly as the full term, tilt only loosely (std 0.5
+    # rad, ~29 deg), as a guard against feet wildly off the clip rather than a hold on the clip's rolled feet --
+    # see feet_orientation above. Restore both and drop motion_foot_ori to go back.
+    # motion_foot_yaw = RewTerm(
+    #     func=mdp.motion_relative_body_yaw_error_exp,
+    #     weight=15.0,
+    #     params={"command_name": "motion", "std": 0.2, "body_names": ["left_foot_link", "right_foot_link"]},
+    # )
+    # motion_foot_tilt = RewTerm(
+    #     func=mdp.motion_relative_body_tilt_error_exp,
+    #     weight=5.0,
+    #     params={"command_name": "motion", "std": 0.5, "body_names": ["left_foot_link", "right_foot_link"]},
+    # )
 
     motion_foot_pos = RewTerm(
         func=mdp.motion_relative_body_position_error_exp,
-        weight=15.0,
+        weight=20.0,
         params={"command_name": "motion", "std": 0.2, "body_names": ["left_foot_link", "right_foot_link"]},
     )
 
