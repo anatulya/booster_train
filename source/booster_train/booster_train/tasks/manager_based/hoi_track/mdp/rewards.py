@@ -457,17 +457,8 @@ class BaseAngVelChangeL2(_StateChangeL2):
         return env.scene[asset_cfg.name].data.root_ang_vel_b
 
 
-def base_lin_vel_norm(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
-    """``||v_base||``, not squared (ULTRA's base linear velocity penalty)."""
-    return torch.norm(env.scene[asset_cfg.name].data.root_lin_vel_b, dim=1)
 
 
-def base_ang_vel_l2(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
-    """``||omega||^2`` on all three axes, in the base frame (ULTRA's base angular velocity penalty).
-
-    Isaac Lab's ``ang_vel_xy_l2`` drops yaw; this keeps it.
-    """
-    return torch.sum(torch.square(env.scene[asset_cfg.name].data.root_ang_vel_b), dim=1)
 
 
 def feet_orientation_l2(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
@@ -492,34 +483,8 @@ def feet_stumble(env: ManagerBasedRLEnv, sensor_cfg: SceneEntityCfg, ratio: floa
     return torch.sum(stumbling.float(), dim=1)
 
 
-def feet_slip(
-    env: ManagerBasedRLEnv,
-    sensor_cfg: SceneEntityCfg,
-    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
-    force_threshold: float = 1.0,
-) -> torch.Tensor:
-    """``sum sqrt(||v_foot_xy||) * 1[contact]``: horizontal foot speed while the foot is on the ground (ULTRA).
-
-    Contact is the *simulated* foot touching anything, read as the peak contact force over the sensor's history
-    (every physics substep of the control step) above ``force_threshold``. The square root makes small slips cost
-    proportionally more than a plain norm would. ``sensor_cfg`` and ``asset_cfg`` must list the same feet in the
-    same order.
-    """
-    sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
-    contact = sensor.data.net_forces_w_history[:, :, sensor_cfg.body_ids].norm(dim=-1).amax(dim=1) > force_threshold
-    asset = env.scene[asset_cfg.name]
-    speed = torch.norm(asset.data.body_lin_vel_w[:, asset_cfg.body_ids, :2], dim=-1)
-    return torch.sum(torch.sqrt(speed + 1e-6) * contact.float(), dim=1)
 
 
-def body_pair_distance_out_of_range(
-    env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg, min_dist: float, max_dist: float
-) -> torch.Tensor:
-    """How far the horizontal distance between two bodies lies outside ``[min_dist, max_dist]``, in metres (ULTRA's
-    feet / knee distance terms): ``|d - clamp(d, min, max)|``, zero anywhere inside the band."""
-    pos = env.scene[asset_cfg.name].data.body_pos_w[:, asset_cfg.body_ids, :2]  # (N, 2, 2)
-    d = torch.norm(pos[:, 0] - pos[:, 1], dim=-1)
-    return torch.abs(d - torch.clamp(d, min=min_dist, max=max_dist))
 
 
 def _debounce_stance(raw: np.ndarray, starts: list[int], lengths: list[int], min_run: int) -> np.ndarray:

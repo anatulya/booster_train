@@ -218,12 +218,6 @@ JOINT_ARMATURE_SCALE = (0.8, 1.2)
 # foot scored ~0.001 there), so lowering a corner by a few mm earned almost nothing. 30 mm puts that same foot at
 # ~0.16, where the slope is real, and -40 doubles what is paid for it.
 FOOT_FLAT_WEIGHT = -40.0
-# Horizontal feet / knee (shank origin) spacing bands for ULTRA's distance penalties, zero inside. ULTRA's [0.25, 0.65]
-# is for a larger robot; the baked K1 references use feet 0.14-0.40 m (boxlarge 0.19-0.34, largebox 0.16-0.40,
-# suitcase 0.14-0.33) and knees 0.17-0.33 m, and the boxlarge settle ends at 0.24 m. These bands sit a few cm outside
-# every reference, so tracking the motion never pays; they only fire when feet/knees close in or splay well past it.
-FEET_DISTANCE_RANGE = (0.12, 0.45)
-KNEE_DISTANCE_RANGE = (0.14, 0.38)
 FOOT_FLAT_TOL = 0.004  # m; corner lift ignored below this
 FOOT_FLAT_SIGMA = 0.03  # m; score exp(-sum(lift^2) / sigma^2), so one corner up 34 mm -> 0.28
 
@@ -708,73 +702,36 @@ class RewardsCfg:
         weight=-1.0,
         params={"asset_cfg": SceneEntityCfg("robot")},
     )
-    # ULTRA's base angular velocity penalty (-0.01 there; 100x here). It damps steady trunk
-    # rocking, which base_ang_vel_change_l2 (jerks only) does not. The references themselves average
-    # ||omega||^2 ~1.0-1.2 (peaks 5-8 while bending), so tracking them costs ~1 per step.
-    base_ang_vel_l2 = RewTerm(
-        func=mdp.base_ang_vel_l2,
-        weight=-1.0,
-        params={"asset_cfg": SceneEntityCfg("robot")},
-    )
-    # ULTRA's base linear velocity penalty, ||v|| unsquared (-0.1 there; 75x here). It pushes against the reference's
-    # own trunk motion: the references average 0.13 m/s (sub03) / 0.27 m/s (sub3), peaking 0.56 / 0.90 while
-    # bending, so tracking them costs ~1-2 per step. If motion_body_lin_vel or motion_body_pos sag, lower it.
-    base_lin_vel = RewTerm(
-        func=mdp.base_lin_vel_norm,
-        weight=-7.5,
-        params={"asset_cfg": SceneEntityCfg("robot")},
-    )
     joint_vel_l2 = RewTerm(
         func=mdp.joint_vel_l2,
         weight=-1e-2,
         params={"asset_cfg": SceneEntityCfg("robot", joint_names=[".*"])},
     )
-    # ULTRA's foot & stability penalties (all but swing clearance and stand-on-feet, which foot_flat_stance already
-    # covers with real stance labels). Weights follow this repo's scaling of ULTRA rather than its raw table: at
-    # ULTRA's own values its regularizers were ~0.03% of our positive reward and never moved anything.
+    # ULTRA's foot terms; the weights are ours. The clips' feet are not flat -- sub3_largebox_003 holds them
+    # rolled ~22 deg onto their edges through the final hold, a retargeting artifact -- and feet_orientation pulls
+    # them flat anyway. How far it gets depends on the orientation term it fights: against a full-orientation
+    # motion_foot_ori (15, std 0.2) a -10 penalty bought ~1 deg of flattening, while against the split's loose
+    # tilt (5, std 0.5) -20 was expected to flatten ~12 of ~18 deg. motion_foot_ori is back at 20 / std 0.2, so
+    # expect the feet to follow the clip's roll again; restore the split below to flatten them.
     #
-    # feet_orientation overlaps foot_flat_stance on stance feet; what it adds is keeping swing feet level too.
-    feet_orientation = RewTerm(
-        func=mdp.feet_orientation_l2,
-        weight=-20.0,
-        params={"asset_cfg": SceneEntityCfg("robot", body_names=["left_foot_link", "right_foot_link"])},
-    )
-    feet_stumble = RewTerm(
-        func=mdp.feet_stumble,
-        weight=-10.0,
-        params={
-            "sensor_cfg": SceneEntityCfg("contact_forces", body_names=["left_foot_link", "right_foot_link"]),
-            "ratio": 4.0,
-        },
-    )
-    # A planted foot sliding or twisting under load: horizontal foot speed while the sim foot is in contact.
-    # -20 (200x ULTRA): at -10 it was ~-2.5 per step on the 32k policy; doubled to make slip clearly costly.
-    foot_slip = RewTerm(
-        func=mdp.feet_slip,
-        weight=-20.0,
-        params={
-            "sensor_cfg": SceneEntityCfg("contact_forces", body_names=["left_foot_link", "right_foot_link"]),
-            "asset_cfg": SceneEntityCfg("robot", body_names=["left_foot_link", "right_foot_link"]),
-        },
-    )
-    feet_distance = RewTerm(
-        func=mdp.body_pair_distance_out_of_range,
-        weight=-10.0,
-        params={
-            "asset_cfg": SceneEntityCfg("robot", body_names=["left_foot_link", "right_foot_link"]),
-            "min_dist": FEET_DISTANCE_RANGE[0],
-            "max_dist": FEET_DISTANCE_RANGE[1],
-        },
-    )
-    knee_distance = RewTerm(
-        func=mdp.body_pair_distance_out_of_range,
-        weight=-10.0,
-        params={
-            "asset_cfg": SceneEntityCfg("robot", body_names=["Left_Shank", "Right_Shank"]),
-            "min_dist": KNEE_DISTANCE_RANGE[0],
-            "max_dist": KNEE_DISTANCE_RANGE[1],
-        },
-    )
+    # Off for now, with motion_foot_ori back at full strength the two would only fight. Kept for reference; replace
+    # the None with this (and restore the split) to flatten the feet again.
+    # feet_orientation = RewTerm(
+    #     func=mdp.feet_orientation_l2,
+    #     weight=-20.0,
+    #     params={"asset_cfg": SceneEntityCfg("robot", body_names=["left_foot_link", "right_foot_link"])},
+    # )
+    feet_orientation = None
+    # Off. Kept for reference; replace the None with this to turn it back on.
+    # feet_stumble = RewTerm(
+    #     func=mdp.feet_stumble,
+    #     weight=-10.0,
+    #     params={
+    #         "sensor_cfg": SceneEntityCfg("contact_forces", body_names=["left_foot_link", "right_foot_link"]),
+    #         "ratio": 4.0,
+    #     },
+    # )
+    feet_stumble = None
     # Off for the HOI task. It penalises contact on every body but the feet, using the *unfiltered*
     # contact_forces sensor, so a hand pressing on the object earns the interaction reward and is fined -10 for
     # touching anything at the same time -- the two terms directly cancel. Re-enable with the hands excluded
