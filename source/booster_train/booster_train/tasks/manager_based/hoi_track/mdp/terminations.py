@@ -92,6 +92,11 @@ class BadObjectPos(ManagerTermBase):
 
     Global object accuracy is still paid for by ``motion_global_object_position_error_exp`` (weight 10), which
     is the right place for it: a gradient, not a kill switch.
+
+    ``world_frame=True`` instead compares the object's world xy with the reference's, ``||p_object - p_object_ref||``
+    over x/y. For clips whose point is moving the object (a push), where the heading-frame check above cannot fire
+    on a robot that holds the box and stays put: the reference robot and box move together, so their relative
+    pose still matches. Off by default; enabled per clip through ``OBJECT_POS_TERMINATION_OVERRIDES``.
     """
 
     def __init__(self, cfg: TerminationTermCfg, env: ManagerBasedRLEnv):
@@ -107,13 +112,18 @@ class BadObjectPos(ManagerTermBase):
         command_name: str,
         threshold: float,
         max_steps: int = 25,
+        world_frame: bool = False,
     ) -> torch.Tensor:
         command: MotionCommand = env.command_manager.get_term(command_name)
-        rel_now = rotate_into_heading(
-            command.robot_anchor_quat_w, command.robot_object_pos_w - command.robot_anchor_pos_w
-        )
-        rel_ref = rotate_into_heading(command.anchor_quat_w, command.object_pos_w - command.anchor_pos_w)
-        bad = torch.norm(rel_now - rel_ref, dim=1) > threshold
+        if world_frame:
+            error = (command.robot_object_pos_w - command.object_pos_w)[:, :2]
+        else:
+            rel_now = rotate_into_heading(
+                command.robot_anchor_quat_w, command.robot_object_pos_w - command.robot_anchor_pos_w
+            )
+            rel_ref = rotate_into_heading(command.anchor_quat_w, command.object_pos_w - command.anchor_pos_w)
+            error = rel_now - rel_ref
+        bad = torch.norm(error, dim=1) > threshold
         absent = _object_absent(env)
         if absent is not None:
             bad &= ~absent

@@ -268,13 +268,29 @@ OBJECT_SIZE_OVERRIDES = {
 }
 
 
+# Per-clip overrides of the object_pos termination, merged into its params. sub7_041_stand is a one-handed push
+# along the floor: the box travels ~0.85 m and the robot ~1 m. The default heading-frame check compares the box
+# with the robot, and both stand still together just as well as they move together, so a policy that grips the
+# box and stays put was never terminated (nor by lost_contact: the reference's right-hand contact comes in bursts
+# of at most 26 frames, each gap resetting its 75-step counter). In world frame, a robot that never pushes passes
+# 0.3 m around frame 105 and is cut 0.5 s later.
+OBJECT_POS_TERMINATION_OVERRIDES = {
+    "sub7_041_stand": {"world_frame": True, "threshold": 0.3, "max_steps": 25},
+}
+
+
 def apply_clip_overrides(cfg, tag: str) -> None:
-    """Merge per-clip overrides into ``cfg``: ``OBJECT_SCENARIO_OVERRIDES`` into the drop event, and
-    ``OBJECT_SIZE_OVERRIDES`` into a new per-axis object-scale event, both keyed by clip tag. Call after
+    """Merge per-clip overrides into ``cfg``: ``OBJECT_SCENARIO_OVERRIDES`` into the drop event,
+    ``OBJECT_POS_TERMINATION_OVERRIDES`` into the object_pos termination, and ``OBJECT_SIZE_OVERRIDES`` into a new
+    per-axis object-scale event, all keyed by clip tag. Call after
     ``set_object_from_motion()``, which this relies on for the object's identity."""
     event = getattr(cfg.events, "object_scenario", None)
     if event is not None and tag in OBJECT_SCENARIO_OVERRIDES:
         event.params = {**event.params, **OBJECT_SCENARIO_OVERRIDES[tag]}
+
+    term = getattr(cfg.terminations, "object_pos", None)
+    if term is not None and tag in OBJECT_POS_TERMINATION_OVERRIDES:
+        term.params = {**term.params, **OBJECT_POS_TERMINATION_OVERRIDES[tag]}
 
     if tag in OBJECT_SIZE_OVERRIDES:
         override = OBJECT_SIZE_OVERRIDES[tag]
