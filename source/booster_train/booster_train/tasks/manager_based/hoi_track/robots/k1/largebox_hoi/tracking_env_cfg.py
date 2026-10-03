@@ -708,20 +708,20 @@ class RewardsCfg:
         weight=-1.0,
         params={"asset_cfg": SceneEntityCfg("robot")},
     )
-    # ULTRA's base angular velocity penalty (-0.01 there; 50x here, like the other regularizers). It damps steady trunk
+    # ULTRA's base angular velocity penalty (-0.01 there; 100x here). It damps steady trunk
     # rocking, which base_ang_vel_change_l2 (jerks only) does not. The references themselves average
-    # ||omega||^2 ~1.0-1.2 (peaks 5-8 while bending), so tracking them costs ~0.5 per step.
+    # ||omega||^2 ~1.0-1.2 (peaks 5-8 while bending), so tracking them costs ~1 per step.
     base_ang_vel_l2 = RewTerm(
         func=mdp.base_ang_vel_l2,
-        weight=-0.5,
+        weight=-1.0,
         params={"asset_cfg": SceneEntityCfg("robot")},
     )
-    # ULTRA's base linear velocity penalty, ||v|| unsquared (-0.1 there; 50x here). It pushes against the reference's
+    # ULTRA's base linear velocity penalty, ||v|| unsquared (-0.1 there; 75x here). It pushes against the reference's
     # own trunk motion: the references average 0.13 m/s (sub03) / 0.27 m/s (sub3), peaking 0.56 / 0.90 while
-    # bending, so tracking them costs ~0.7-1.3 per step. If motion_body_lin_vel or motion_body_pos sag, lower it.
+    # bending, so tracking them costs ~1-2 per step. If motion_body_lin_vel or motion_body_pos sag, lower it.
     base_lin_vel = RewTerm(
         func=mdp.base_lin_vel_norm,
-        weight=-5.0,
+        weight=-7.5,
         params={"asset_cfg": SceneEntityCfg("robot")},
     )
     joint_vel_l2 = RewTerm(
@@ -748,9 +748,10 @@ class RewardsCfg:
         },
     )
     # A planted foot sliding or twisting under load: horizontal foot speed while the sim foot is in contact.
+    # -20 (200x ULTRA): at -10 it was ~-2.5 per step on the 32k policy; doubled to make slip clearly costly.
     foot_slip = RewTerm(
         func=mdp.feet_slip,
-        weight=-10.0,
+        weight=-20.0,
         params={
             "sensor_cfg": SceneEntityCfg("contact_forces", body_names=["left_foot_link", "right_foot_link"]),
             "asset_cfg": SceneEntityCfg("robot", body_names=["left_foot_link", "right_foot_link"]),
