@@ -35,6 +35,30 @@ def object_link(name: str) -> str:
     return f"{name}_link"
 
 
+def mesh_bounds(name: str) -> tuple[tuple[float, float, float], tuple[float, float, float]]:
+    """The object's raw (unscaled) mesh bounding box ``(mins, maxs)``, each (x, y, z), in its own local frame.
+
+    Parses the ``.obj``'s vertex lines directly -- no Isaac Sim needed, so this is safe to call at config
+    time (e.g. from a per-clip ``EventTermCfg`` that computes a scale range to hit a real-world target size).
+    """
+    mins = [float("inf")] * 3
+    maxs = [float("-inf")] * 3
+    with open(f"{OBJECT_DIR}/{name}/{name}.obj") as f:
+        for line in f:
+            if line.startswith("v "):
+                for i, coord in enumerate(line.split()[1:4]):
+                    v = float(coord)
+                    mins[i] = min(mins[i], v)
+                    maxs[i] = max(maxs[i], v)
+    return tuple(mins), tuple(maxs)
+
+
+def mesh_extent(name: str) -> tuple[float, float, float]:
+    """The object's raw (unscaled) mesh bounding-box size (x, y, z), in metres. See :func:`mesh_bounds`."""
+    mins, maxs = mesh_bounds(name)
+    return tuple(hi - lo for lo, hi in zip(mins, maxs))
+
+
 def object_cfg(name: str) -> RigidObjectCfg:
     return RigidObjectCfg(
         spawn=sim_utils.UrdfFileCfg(

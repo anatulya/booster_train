@@ -87,6 +87,25 @@ class MotionLoader:
             self.object_ang_vel_w = cat("object_ang_vel_w")
             self.contact = cat("contact") if all("contact" in d for d in datas) else None
         self.has_contact = self.has_object and getattr(self, "contact", None) is not None
+        # Per-foot reference stance labels (0/1), present only in npz baked from a .pt that carries them (see
+        # pt_to_npz_with_offline_video.py's STANCE_CHANNELS). Clip-by-clip: ``stance_labelled`` marks the frames whose
+        # clip had labels, so a mixed set can fall back to a kinematic guess on the rest (rewards.reference_stance).
+        self.stance_names = None
+        self.stance = None
+        self.stance_labelled = None
+        if any("stance" in d for d in datas):
+            names = {tuple(d["stance_names"].tolist()) for d in datas if "stance" in d}
+            if len(names) != 1:
+                raise ValueError(f"clips disagree on stance_names: {names}")
+            self.stance_names = list(names.pop())
+            width = len(self.stance_names)
+            self.stance = torch.tensor(
+                np.concatenate([d["stance"] if "stance" in d else np.zeros((len(d["joint_pos"]), width)) for d in datas]),
+                dtype=torch.float32, device=device,
+            )
+            self.stance_labelled = torch.tensor(
+                np.concatenate([np.full(len(d["joint_pos"]), "stance" in d) for d in datas]), device=device
+            )
         self.time_step_total = self.joint_pos.shape[0]
         self.tail_len = tail_len
 
@@ -258,6 +277,49 @@ class MotionCommand(CommandTerm):
                 src = torch.where(nxt < starts.numel(), starts[nxt.clamp(max=starts.numel() - 1)], held[-1])
                 target[lo + free, side] = local[lo + src, side]
         return target
+
+    def contact_point_local_scaled(self, frames: torch.Tensor) -> torch.Tensor:
+        """``contact_point_local[frames]``, rescaled by ``env.object_scale`` where that's set.
+
+        ``contact_point_local`` is a raw metre offset from motion-capture FK (see ``_compute_contact_targets``),
+        with no notion of the sim mesh's geometry. If an env's object has been resized (``events.
+        randomize_rigid_object_scale_and_store``), the unscaled offset no longer sits on that env's own box
+        surface; this multiplies it back onto it. ``env.object_scale`` is absent for every task that doesn't
+        configure that event, so this is then exactly ``contact_point_local[frames]`` -- unchanged.
+        """
+        local = self.contact_point_local[frames]  # (N, P, 3)
+        scale = getattr(self._env, "object_scale", None)
+        if scale is not None:
+            local = local * scale[:, None, :]
+        return local
+
+    def _rest_scaled_object_on_floor(
+        self, ids: torch.Tensor, object_pos: torch.Tensor, object_quat: torch.Tensor
+    ) -> torch.Tensor:
+        """Shift a resized object vertically so that, if the reference has it resting on the floor, it still does.
+
+        The USD scale is about the object's origin, so a taller/shorter box placed at the reference pose would
+        start sunk into or floating above the floor. Only frames where the *unscaled* box's lowest bounding-box
+        corner is within ``REST_TOL`` of the floor are shifted; a box held in the air stays at the reference pose,
+        which keeps it centred between the palms (whose targets ``contact_point_local_scaled`` scales about the
+        same origin). No-op unless ``env.object_scale`` and ``env.object_mesh_bounds`` are both set.
+        """
+        REST_TOL = 0.02
+        scale = getattr(self._env, "object_scale", None)
+        bounds = getattr(self._env, "object_mesh_bounds", None)
+        if scale is None or bounds is None:
+            return object_pos
+        # The 8 local bounding-box corners, (8, 3), then their world height offset from the object origin.
+        corners = torch.stack(
+            [bounds[[i, j, k], [0, 1, 2]] for i in (0, 1) for j in (0, 1) for k in (0, 1)]
+        )
+        quat = object_quat[:, None, :].expand(-1, 8, -1)
+        low_native = quat_apply(quat, corners.expand(len(ids), -1, -1))[..., 2].amin(1)
+        low_scaled = quat_apply(quat, corners * scale[ids, None, :])[..., 2].amin(1)
+        resting = object_pos[:, 2] + low_native < REST_TOL
+        object_pos = object_pos.clone()
+        object_pos[:, 2] += torch.where(resting, low_native - low_scaled, 0.0)
+        return object_pos
 
     def reference_frames(self, k: int = 0) -> torch.Tensor:
         """Motion frame index at horizon offset ``k``, clamped to the end of each env's own clip."""
@@ -551,6 +613,8 @@ class MotionCommand(CommandTerm):
                 # its own (possibly tilted) up axis. z/roll/pitch stay untouched: the box keeps sitting flat.
                 yaw_delta = quat_from_euler_xyz(zeros, zeros, yaw_samples)
                 object_quat = quat_mul(yaw_delta, object_quat)
+
+            object_pos = self._rest_scaled_object_on_floor(ids, object_pos, object_quat)
 
             object_state = torch.cat(
                 [

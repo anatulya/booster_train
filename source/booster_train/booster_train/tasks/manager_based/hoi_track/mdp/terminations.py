@@ -217,7 +217,7 @@ class LostContact(ManagerTermBase):
     ) -> torch.Tensor:
         command: MotionCommand = env.command_manager.get_term(command_name)
 
-        local = command.contact_point_local[command.reference_frames(0)]  # (N, P, 3), object frame
+        local = command.contact_point_local_scaled(command.reference_frames(0))  # (N, P, 3), object frame
         quat = command.robot_object_quat_w[:, None, :].expand(-1, local.shape[1], -1)
         target = command.robot_object_pos_w[:, None, :] + math_utils.quat_apply(quat, local)
         dist = torch.norm(command.robot_palm_pos_w - target, dim=-1)  # (N, P)

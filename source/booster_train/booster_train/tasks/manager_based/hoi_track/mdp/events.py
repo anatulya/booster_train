@@ -4,11 +4,18 @@ import torch
 from collections.abc import Sequence
 from typing import TYPE_CHECKING, Literal
 
+from pxr import Gf, Sdf, UsdGeom, Vt
+
+import isaaclab.sim as sim_utils
 import isaaclab.utils.math as math_utils
 from isaaclab.assets import Articulation, RigidObject
 from isaaclab.envs.mdp.events import _randomize_prop_by_op, push_by_setting_velocity
 from isaaclab.managers import EventTermCfg, ManagerTermBase, SceneEntityCfg
+from isaaclab.sim.utils.stage import get_current_stage
 
+import re
+
+from booster_train.assets.robots.actuator import BoosterDelayedPDActuator
 from booster_train.tasks.manager_based.hoi_track.mdp.rewards import hand_object_normal_force
 
 if TYPE_CHECKING:
@@ -168,6 +175,147 @@ def randomize_rigid_object_inertia_scale(
     asset.root_physx_view.set_inertias(inertias, env_ids)
 
 
+def randomize_actuator_dr(
+    env: ManagerBasedEnv,
+    env_ids: torch.Tensor | None,
+    kp_beta: tuple[float, float],
+    kp_range: tuple[float, float],
+    kd_range: tuple[float, float],
+    strength_range: tuple[float, float],
+    friction_max: dict[str, tuple[float, float]],
+    fixed: dict | None = None,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+):
+    """Per-episode actuator randomization for every :class:`BoosterDelayedPDActuator` on the robot (mode ``reset``).
+
+    One draw per env, shared by all joints:
+
+    - Kp scale ``kp_range[0] + (kp_range[1] - kp_range[0]) * Beta(*kp_beta)`` -- skewed below 1;
+    - Kd scale ``U(kd_range)``, independent of Kp;
+    - motor strength ``U(strength_range)``: the PD torque and its limit are both scaled by it.
+
+    Joint friction is drawn per joint: ``friction_max`` maps a joint-name regex to the upper bounds
+    ``(static Nm, viscous Nm*s/rad)``, each drawn ``U(0, max)``; the first matching pattern wins, unmatched joints
+    get none. See :meth:`BoosterDelayedPDActuator.set_dr` for how the actuator applies them.
+
+    ``fixed`` (render / stress test only) replaces sampling: ``{"kp": s, "kd": s, "strength": s}`` and
+    ``"friction": "max"`` to pin every joint's friction at its upper bound (omitted keys stay nominal / zero).
+    """
+    robot: Articulation = env.scene[asset_cfg.name]
+    device = env.device
+    if env_ids is None:
+        env_ids = torch.arange(env.scene.num_envs, device=device)
+    else:
+        env_ids = env_ids.to(device)
+    n = len(env_ids)
+    if fixed is None:
+        beta = torch.distributions.Beta(torch.tensor(float(kp_beta[0]), device=device), torch.tensor(float(kp_beta[1]), device=device))
+        kp = kp_range[0] + (kp_range[1] - kp_range[0]) * beta.sample((n,))
+        kd = math_utils.sample_uniform(*kd_range, (n,), device=device)
+        strength = math_utils.sample_uniform(*strength_range, (n,), device=device)
+    else:
+        kp = torch.full((n,), float(fixed.get("kp", 1.0)), device=device)
+        kd = torch.full((n,), float(fixed.get("kd", 1.0)), device=device)
+        strength = torch.full((n,), float(fixed.get("strength", 1.0)), device=device)
+
+    for actuator in robot.actuators.values():
+        if not isinstance(actuator, BoosterDelayedPDActuator):
+            continue
+        bounds = torch.zeros(len(actuator.joint_names), 2, device=device)
+        for j, name in enumerate(actuator.joint_names):
+            for pattern, limits in friction_max.items():
+                if re.fullmatch(pattern, name):
+                    bounds[j] = torch.tensor(limits, device=device)
+                    break
+        if fixed is None:
+            draw = torch.rand(n, len(actuator.joint_names), 2, device=device) * bounds
+        elif fixed.get("friction") == "max":
+            draw = bounds.expand(n, -1, -1)
+        else:
+            draw = torch.zeros(n, len(actuator.joint_names), 2, device=device)
+        actuator.set_dr(env_ids, kp, kd, strength, draw[..., 0], draw[..., 1])
+
+
+def randomize_rigid_object_scale_and_store(
+    env: ManagerBasedEnv,
+    env_ids: torch.Tensor | None,
+    scale_range: dict[str, tuple[float, float]],
+    asset_cfg: SceneEntityCfg,
+    relative_child_path: str | None = None,
+    mesh_bounds: tuple[tuple[float, float, float], tuple[float, float, float]] | None = None,
+):
+    """Randomize a :class:`RigidObject`'s per-axis USD scale, and remember the sampled values on ``env``.
+
+    Same USD-write as isaaclab's :func:`~isaaclab.envs.mdp.events.randomize_rigid_body_scale` (per-axis
+    ``xformOp:scale``, must run in ``mode="prestartup"`` -- before ``sim.play()`` -- and needs
+    ``InteractiveSceneCfg.replicate_physics = False`` for the scale to actually differ per env), but that
+    function samples and discards its values, which is fine for a cosmetic size randomization but not here:
+    :meth:`~.commands.MotionCommand.contact_point_local_scaled` needs each env's own sampled scale to keep the
+    hand-contact target on the surface of whatever size box that env actually got. Stored as ``env.object_scale``,
+    ``(num_envs, 3)``, defaulting to 1 for envs this event never touches.
+
+    ``mesh_bounds`` -- the unscaled mesh's local ``(mins, maxs)`` -- is stored as ``env.object_mesh_bounds``,
+    ``(2, 3)``, so :meth:`~.commands.MotionCommand._resample_command` can keep a resting box flush with the floor
+    when its scale changes its height.
+
+    Isaac Lab 2.3 has no term that both randomizes rigid-body scale *and* exposes the sample it drew, so this
+    fills that gap the same way :func:`randomize_rigid_object_inertia_scale` fills the missing-inertia-term gap.
+    """
+    if env.sim.is_playing():
+        raise RuntimeError(
+            "randomize_rigid_object_scale_and_store must run before the simulation starts (mode='prestartup');"
+            " called while playing leads to unpredictable behavior."
+        )
+    asset: RigidObject = env.scene[asset_cfg.name]
+    if isinstance(asset, Articulation):
+        raise ValueError("Scaling an articulation randomly is not supported; see isaaclab's own scale term.")
+
+    if not hasattr(env, "object_scale"):
+        env.object_scale = torch.ones(env.num_envs, 3, device=env.device)
+
+    if env_ids is None:
+        env_ids = torch.arange(env.scene.num_envs, device="cpu")
+    else:
+        env_ids = env_ids.cpu()
+
+    range_list = [scale_range.get(key, (1.0, 1.0)) for key in ["x", "y", "z"]]
+    ranges = torch.tensor(range_list, device="cpu")
+    rand_samples = math_utils.sample_uniform(ranges[:, 0], ranges[:, 1], (len(env_ids), 3), device="cpu")
+
+    env.object_scale[env_ids.to(env.device)] = rand_samples.to(env.device)
+    if mesh_bounds is not None:
+        env.object_mesh_bounds = torch.tensor(mesh_bounds, device=env.device, dtype=torch.float32)
+
+    stage = get_current_stage()
+    prim_paths = sim_utils.find_matching_prim_paths(asset.cfg.prim_path)
+    child = "" if relative_child_path is None else (
+        relative_child_path if relative_child_path.startswith("/") else "/" + relative_child_path
+    )
+
+    rand_list = rand_samples.tolist()
+    with Sdf.ChangeBlock():
+        for i, env_id in enumerate(env_ids):
+            prim_path = prim_paths[env_id] + child
+            prim_spec = Sdf.CreatePrimInLayer(stage.GetRootLayer(), prim_path)
+
+            scale_spec = prim_spec.GetAttributeAtPath(prim_path + ".xformOp:scale")
+            has_scale_attr = scale_spec is not None
+            if not has_scale_attr:
+                # Note: isaaclab's own randomize_rigid_body_scale passes `prim_path + ".xformOp:scale"` here,
+                # which raises ("invalid name") the first time a prim has no pre-existing scale op -- the name
+                # argument must be the bare attribute name, as the xformOpOrder spec right below already does.
+                scale_spec = Sdf.AttributeSpec(prim_spec, "xformOp:scale", Sdf.ValueTypeNames.Double3)
+            scale_spec.default = Gf.Vec3f(*rand_list[i])
+
+            if not has_scale_attr:
+                op_order_spec = prim_spec.GetAttributeAtPath(prim_path + ".xformOpOrder")
+                if op_order_spec is None:
+                    op_order_spec = Sdf.AttributeSpec(
+                        prim_spec, UsdGeom.Tokens.xformOpOrder, Sdf.ValueTypeNames.TokenArray
+                    )
+                op_order_spec.default = Vt.TokenArray(["xformOp:translate", "xformOp:orient", "xformOp:scale"])
+
+
 def randomize_rigid_object_material_with_ratio(
     env: ManagerBasedEnv,
     env_ids: torch.Tensor | None,
@@ -249,8 +397,13 @@ class ObjectScenario(ManagerTermBase):
 
     * ``0`` regular -- the task as it has always been. This term does nothing to it.
     * ``1`` forced drop -- at a reference contact frame chosen at reset, a downward world-frame force of
-      :math:`k\,m\,g` pushes the box until the simulated hands have been off it for ``release_steps``
-      consecutive steps. Only then does the grasp count as dropped.
+      :math:`k\,m\,g + F_{abs}` pushes the box until the simulated hands have been off it for ``release_steps``
+      consecutive steps. Only then does the grasp count as dropped. :math:`k` is drawn from
+      ``force_scale_range``; :math:`F_{abs}` from ``force_abs_range`` (N, default 0) covers grip friction, which
+      does not scale with the box's weight, so light boxes still get pushed hard enough to leave the hands.
+      With ``drop_delay_s`` set, the drop lands on the first eligible frame at least that long (drawn per
+      episode) after the episode start; drawn from the whole reachable episode instead (the default), a drop
+      on boxlarge came after the episode had already ended in 72% of drop episodes.
     * ``2`` no object -- the box is parked ``park_offset`` above the env origin for the whole episode.
 
     Scenarios 1 and 2 bypass adaptive sampling. The command calls :meth:`presample` right after its own bin
@@ -298,6 +451,7 @@ class ObjectScenario(ManagerTermBase):
         self.force_capped = torch.zeros(n, **flag)
         self.object_absent = torch.zeros(n, **flag)
         self.force_scale = torch.zeros(n, device=self.device)
+        self.force_abs = torch.zeros(n, device=self.device)
         self.next_scenario = torch.zeros(n, **long)
         self.err_sums = {name: torch.zeros(n, device=self.device) for name in self.TRACKED_ERRORS}
         self.err_counts = torch.zeros(n, device=self.device)
@@ -408,12 +562,21 @@ class ObjectScenario(ManagerTermBase):
         presampled = self.presampled[ids]
         scenario = torch.where(presampled, self.next_scenario[ids], self._deal(ids))
         self.presampled[ids] = False
-        # -- and for drops, the frame: uniform over eligible frames this episode can still reach
+        # -- and for drops, the frame. With drop_delay_s: the first eligible frame at or after start + delay, so
+        # the drop lands early enough that the episode is still running. Without: uniform over the eligible frames
+        # this episode can still reach. No eligible frame left turns the episode regular.
         cum = self._eligible_cum
         start = command.time_steps[ids]
         end = self._drop_window_end(start, command.motion_ids[ids], command.motion)
+        d_lo, d_hi = params.get("drop_delay_s", (0.0, 0.0))
+        if d_hi > 0:
+            delay = ((torch.rand(len(ids), device=self.device) * (d_hi - d_lo) + d_lo) / self._env.step_dt).long()
+            start = torch.minimum(start + delay, end)
         count = cum[end] - cum[start]
-        rank = torch.minimum((torch.rand(len(ids), device=self.device) * count).long(), (count - 1).clamp(min=0))
+        if d_hi > 0:
+            rank = torch.zeros_like(count)
+        else:
+            rank = torch.minimum((torch.rand(len(ids), device=self.device) * count).long(), (count - 1).clamp(min=0))
         frame = torch.searchsorted(cum, (cum[start] + rank + 1).contiguous()) - 1
         scenario = torch.where((scenario == self.DROP) & (count == 0), self.REGULAR, scenario)
 
@@ -424,6 +587,8 @@ class ObjectScenario(ManagerTermBase):
         for kind, name in enumerate(self.SCENARIO_NAMES):
             log[f"Scenario/{name}_share"] = (scenario == kind).float().mean()
         self.force_scale[ids] = torch.rand(len(ids), device=self.device) * (hi - lo) + lo
+        a_lo, a_hi = params.get("force_abs_range", (0.0, 0.0))
+        self.force_abs[ids] = torch.rand(len(ids), device=self.device) * (a_hi - a_lo) + a_lo
         self.trigger_step[ids] = 0
         self.release_step[ids] = 0
         self.no_contact_steps[ids] = 0
@@ -537,7 +702,7 @@ class ObjectScenario(ManagerTermBase):
             self._mass = self.asset.root_physx_view.get_masses().to(self.device).view(self.num_envs, -1).sum(-1)
         gravity = abs(self._env.sim.cfg.gravity[2])
         forces = torch.zeros(self.num_envs, 1, 3, device=self.device)
-        forces[:, 0, 2] = -(active.float() * self.force_scale * self._mass * gravity)
+        forces[:, 0, 2] = -(active.float() * (self.force_scale * self._mass * gravity + self.force_abs))
         self.asset.permanent_wrench_composer.set_forces_and_torques(
             forces=forces, torques=torch.zeros_like(forces), is_global=True
         )
@@ -553,6 +718,8 @@ class ObjectScenario(ManagerTermBase):
         probabilities: tuple[float, float, float],
         fixed_scenarios: tuple[int, ...] | None = None,
         force_scale_range: tuple[float, float] = (2.0, 4.0),
+        force_abs_range: tuple[float, float] = (0.0, 0.0),
+        drop_delay_s: tuple[float, float] = (0.0, 0.0),
         release_steps: int = 5,
         max_force_s: float = 1.0,
         min_lift: float = 0.1,

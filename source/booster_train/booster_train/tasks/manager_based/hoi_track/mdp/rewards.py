@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import numpy as np
 import torch
 from collections.abc import Sequence
 from typing import TYPE_CHECKING, Union
@@ -357,7 +358,7 @@ class HandObjectInteraction(ManagerTermBase):
     ) -> torch.Tensor:
         command: MotionCommand = env.command_manager.get_term(command_name)
 
-        local = command.contact_point_local[command.reference_frames(0)]  # (N, P, 3), object frame
+        local = command.contact_point_local_scaled(command.reference_frames(0))  # (N, P, 3), object frame
         quat = command.robot_object_quat_w[:, None, :].expand(-1, local.shape[1], -1)
         target = command.robot_object_pos_w[:, None, :] + quat_apply(quat, local)
         dist = torch.norm(command.robot_palm_pos_w - target, dim=-1)  # (N, P); a norm, so frame-free
@@ -456,6 +457,19 @@ class BaseAngVelChangeL2(_StateChangeL2):
         return env.scene[asset_cfg.name].data.root_ang_vel_b
 
 
+def base_lin_vel_norm(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
+    """``||v_base||``, not squared (ULTRA's base linear velocity penalty)."""
+    return torch.norm(env.scene[asset_cfg.name].data.root_lin_vel_b, dim=1)
+
+
+def base_ang_vel_l2(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
+    """``||omega||^2`` on all three axes, in the base frame (ULTRA's base angular velocity penalty).
+
+    Isaac Lab's ``ang_vel_xy_l2`` drops yaw; this keeps it.
+    """
+    return torch.sum(torch.square(env.scene[asset_cfg.name].data.root_ang_vel_b), dim=1)
+
+
 def feet_orientation_l2(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
     """``sum ||g_foot_xy||^2``: foot tilt from gravity, from the gravity vector rotated into each foot's frame.
 
@@ -476,3 +490,402 @@ def feet_stumble(env: ManagerBasedRLEnv, sensor_cfg: SceneEntityCfg, ratio: floa
     force = sensor.data.net_forces_w[:, sensor_cfg.body_ids]  # (N, F, 3)
     stumbling = torch.norm(force[..., :2], dim=-1) > ratio * torch.abs(force[..., 2])
     return torch.sum(stumbling.float(), dim=1)
+
+
+def feet_slip(
+    env: ManagerBasedRLEnv,
+    sensor_cfg: SceneEntityCfg,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    force_threshold: float = 1.0,
+) -> torch.Tensor:
+    """``sum sqrt(||v_foot_xy||) * 1[contact]``: horizontal foot speed while the foot is on the ground (ULTRA).
+
+    Contact is the *simulated* foot touching anything, read as the peak contact force over the sensor's history
+    (every physics substep of the control step) above ``force_threshold``. The square root makes small slips cost
+    proportionally more than a plain norm would. ``sensor_cfg`` and ``asset_cfg`` must list the same feet in the
+    same order.
+    """
+    sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
+    contact = sensor.data.net_forces_w_history[:, :, sensor_cfg.body_ids].norm(dim=-1).amax(dim=1) > force_threshold
+    asset = env.scene[asset_cfg.name]
+    speed = torch.norm(asset.data.body_lin_vel_w[:, asset_cfg.body_ids, :2], dim=-1)
+    return torch.sum(torch.sqrt(speed + 1e-6) * contact.float(), dim=1)
+
+
+def body_pair_distance_out_of_range(
+    env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg, min_dist: float, max_dist: float
+) -> torch.Tensor:
+    """How far the horizontal distance between two bodies lies outside ``[min_dist, max_dist]``, in metres (ULTRA's
+    feet / knee distance terms): ``|d - clamp(d, min, max)|``, zero anywhere inside the band."""
+    pos = env.scene[asset_cfg.name].data.body_pos_w[:, asset_cfg.body_ids, :2]  # (N, 2, 2)
+    d = torch.norm(pos[:, 0] - pos[:, 1], dim=-1)
+    return torch.abs(d - torch.clamp(d, min=min_dist, max=max_dist))
+
+
+def _debounce_stance(raw: np.ndarray, starts: list[int], lengths: list[int], min_run: int) -> np.ndarray:
+    """Absorb stance/swing runs shorter than ``min_run`` into the run before them, per clip.
+
+    Same logic as ``scripts/rsl_rl/play.py``'s ``CoPOverlay._debounce`` (a separate copy there, not a caller of
+    this), so the render-time overlay and this training-time term build the reference-stance table the same way.
+    """
+    out = raw.copy()
+    for start, length in zip(starts, lengths):
+        seg = out[start : start + length]
+        i = 0
+        while i < length:
+            j = i
+            while j < length and seg[j] == seg[i]:
+                j += 1
+            if j - i < min_run and i > 0:
+                seg[i:j] = seg[i - 1]
+            i = j
+    return out
+
+
+STANCE_HEIGHT = 0.04  # m above that foot's lowest reference ankle height in the clip
+STANCE_SPEED = 0.25  # m/s, reference foot horizontal speed
+STANCE_MIN_RUN = 3  # frames
+
+
+def reference_stance(command: MotionCommand, foot_body_names: Sequence[str]) -> tuple[torch.Tensor, torch.Tensor]:
+    """Per-frame reference stance for each foot, ``(T, F)`` bool, and which frames were labelled, ``(T,)`` bool.
+
+    Frames of a clip baked with stance labels (``MotionLoader.stance``) use those. Every other frame falls back to a
+    kinematic guess from the reference: ankle within ``STANCE_HEIGHT`` of that foot's lowest point in its clip and
+    horizontal speed below ``STANCE_SPEED``, with runs shorter than ``STANCE_MIN_RUN`` frames absorbed (the same
+    heuristic as ``scripts/rsl_rl/play.py``'s ``CoPOverlay``). Height is clip-relative because the retargeted feet
+    do not sit at one height across clips.
+    """
+    motion = command.motion
+    device = motion.body_pos_w.device
+    clip_of_frame = torch.repeat_interleave(torch.arange(motion.num_clips, device=device), motion.clip_lengths)
+    starts, lengths = motion.clip_starts.tolist(), motion.clip_lengths.tolist()
+    labelled = (
+        motion.stance_labelled
+        if getattr(motion, "stance_labelled", None) is not None
+        else torch.zeros(motion.time_step_total, dtype=torch.bool, device=device)
+    )
+    columns = []
+    for name in foot_body_names:
+        k = command.cfg.body_names.index(name)
+        z = motion.body_pos_w[:, k, 2]
+        clip_min = torch.full((motion.num_clips,), float("inf"), device=device).scatter_reduce(
+            0, clip_of_frame, z, reduce="amin"
+        )
+        speed = torch.norm(motion.body_lin_vel_w[:, k, :2], dim=-1)
+        raw = ((z - clip_min[clip_of_frame] < STANCE_HEIGHT) & (speed < STANCE_SPEED)).cpu().numpy()
+        guess = torch.tensor(_debounce_stance(raw, starts, lengths, STANCE_MIN_RUN), device=device)
+        if labelled.any():
+            label = motion.stance[:, motion.stance_names.index(name)] > 0.5
+            guess = torch.where(labelled, label, guess)
+        columns.append(guess)
+    return torch.stack(columns, dim=1), labelled
+
+
+def _weighted_contact_agg(
+    forces: torch.Tensor, points: torch.Tensor, counts: torch.Tensor, starts: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Force-weighted sum of contact points and total force, per (env, body) row, from a ragged contact buffer.
+
+    ``forces``/``points`` are the flat per-contact arrays ``contact_physx_view.get_contact_data`` returns;
+    ``counts``/``starts`` say which slice of them belongs to each row. Isaac Lab's own
+    ``ContactSensor._unpack_contact_buffer_data`` does the analogous *unweighted* mean for ``contact_pos_w`` with
+    ``repeat_interleave``, which needs the total count on the host (a GPU sync every step); this instead maps
+    every buffer slot to its row with ``searchsorted`` over the sorted row starts and masks the unused tail, so
+    it never leaves the GPU. Weighted by force, so the result is a genuine centre of pressure rather than a
+    plain average of the contact points.
+    """
+    n_rows = counts.numel()
+    starts, counts = starts.long(), counts.long()
+    # Empty rows can share a start with a non-empty one; sorting on (start, non-empty) puts the non-empty row
+    # last among ties, which is the one searchsorted(right=True) - 1 lands on.
+    order = torch.argsort(starts * 2 + (counts > 0).long())
+    sorted_starts = starts[order]
+    slot = torch.arange(forces.shape[0], device=counts.device)
+    row_ids = order[(torch.searchsorted(sorted_starts, slot, right=True) - 1).clamp(min=0)]
+    valid = (slot >= starts[row_ids]) & (slot < starts[row_ids] + counts[row_ids])
+    # where, not multiply: unused slots may hold garbage, and 0 * nan is still nan.
+    f = torch.where(valid, forces.view(-1).abs(), 0.0)
+    p = torch.where(valid[:, None], points, 0.0)
+    sum_force = torch.zeros(n_rows, device=counts.device, dtype=points.dtype).index_add_(0, row_ids, f)
+    sum_force_pos = torch.zeros(n_rows, 3, device=counts.device, dtype=points.dtype).index_add_(
+        0, row_ids, f[:, None] * p
+    )
+    return sum_force, sum_force_pos
+
+
+class CoPSupportCentering(ManagerTermBase):
+    r"""Penalizes the global centre of pressure for wandering off the robot's own intended base of support.
+
+    The reference contributes exactly one thing: a per-foot in-stance label (``c_ref``, from
+    :func:`reference_stance`: the clip's baked labels where it has them, a kinematic guess otherwise), deciding *which* feet
+    are expected to support the robot right now. Every position below -- the support geometry and the CoP
+    itself -- comes from the *simulated* robot, never from the reference body poses, so this cannot simply
+    duplicate ``motion_foot_pos``/``motion_foot_ori`` (which pull individual feet onto the reference's own foot
+    poses): it is blind to where the reference thinks a foot should be, and only checks whether the robot's own
+    ground reaction sits under its own stance foot/feet.
+
+    Sibling of ``scripts/rsl_rl/play.py``'s ``CoPOverlay``, which visualizes exactly this pair (support centre
+    vs global CoP) at render time; the reference-stance heuristic, sole geometry and force-weighted contact
+    aggregation are all identical to it on purpose, so a checkpoint's training-time numbers and its rendered
+    overlay agree.
+
+    .. math::
+        p_{support} &= \frac{\sum_f c_{ref,f}\, p_{foot,f}}{\sum_f c_{ref,f} + \epsilon} \\
+        p_{cop}     &= \frac{\sum_f F_{z,f}\, p_{cop,f}}{\sum_f F_{z,f} + \epsilon},\quad
+                       p_{cop,f} = \frac{\sum_j F_{z,j}\, p_j}{\sum_j F_{z,j} + \epsilon} \\
+        d           &= \lVert p_{cop} - p_{support} \rVert \\
+        \text{penalty} &= \frac{\mathrm{clamp}(d - r_{free},\, 0)}{scale}
+
+    Zero inside ``free_radius`` -- ordinary sway near the support centre costs nothing -- and zero whenever
+    there is no signal to judge: no foot in reference stance, or negligible total ground load (airborne).
+
+    Not gated by ``_object_absent``: this is a general balance term, not an object-interaction one -- the robot
+    still needs to keep its ground reaction under itself in drop/no-object scenarios, arguably more so.
+    """
+
+    SOLE_CENTRE = (0.0215, 0.0, -0.038)  # foot frame; same as CoPOverlay.SOLE_CENTRE
+    BUDGET_CHECK_EVERY = 500  # calls; the overflow check is a host sync, so it only samples
+
+    TERMS = ("dist", "excess", "penalty", "forward_offset", "lateral_offset")
+
+    def __init__(self, cfg: RewardTermCfg, env: ManagerBasedRLEnv):
+        super().__init__(cfg, env)
+        self._stance: torch.Tensor | None = None  # (T, F) bool, built lazily on first call
+        self._foot_body_names: tuple[str, ...] | None = None
+        self._robot_foot_ids: list[int] | None = None
+        self._sensor_body_ids: list[int] | None = None
+        self._sensor_num_bodies: int | None = None
+        self._sole_local: torch.Tensor | None = None
+        self._budget_warned = False
+        self._calls = 0
+
+        self.sums = {name: torch.zeros(self.num_envs, device=self.device) for name in self.TERMS}
+        self.counts = torch.zeros(self.num_envs, device=self.device)
+        self.active_count = torch.zeros(self.num_envs, device=self.device)
+        self.step_count = torch.zeros(self.num_envs, device=self.device)
+        self.imbalance_sum = torch.zeros(self.num_envs, device=self.device)
+        self.imbalance_count = torch.zeros(self.num_envs, device=self.device)
+
+    def reset(self, env_ids: Sequence[int] | None = None) -> None:
+        ids = slice(None) if env_ids is None else env_ids
+        log = self._env.extras.setdefault("log", {})
+
+        counts = self.counts[ids]
+        seen = counts > 0
+        for name in self.TERMS:
+            if seen.any():
+                log[f"CoP/{name}"] = (self.sums[name][ids][seen] / counts[seen]).mean()
+            self.sums[name][ids] = 0.0
+        self.counts[ids] = 0.0
+
+        steps = self.step_count[ids]
+        seen_steps = steps > 0
+        if seen_steps.any():
+            log["CoP/active_frac"] = (self.active_count[ids][seen_steps] / steps[seen_steps]).mean()
+        self.active_count[ids] = 0.0
+        self.step_count[ids] = 0.0
+
+        imb_n = self.imbalance_count[ids]
+        seen_imb = imb_n > 0
+        if seen_imb.any():
+            log["CoP/load_imbalance"] = (self.imbalance_sum[ids][seen_imb] / imb_n[seen_imb]).mean()
+        self.imbalance_sum[ids] = 0.0
+        self.imbalance_count[ids] = 0.0
+
+    def _setup(self, command: MotionCommand, sensor: ContactSensor, foot_body_names: tuple[str, ...]) -> None:
+        """One-time build of the reference-stance table and the name->index lookups. Deferred past ``__init__``
+        for the same reason ``events.ObjectScenario`` defers its setup: the command term's motion data is not
+        guaranteed ready at manager-construction time, only once the env has actually reset/stepped.
+        """
+        device = self.device
+        self._stance, _ = reference_stance(command, foot_body_names)
+
+        self._foot_body_names = foot_body_names
+        self._robot_foot_ids = [self._env.scene["robot"].body_names.index(n) for n in foot_body_names]
+        self._sensor_body_ids = [sensor.body_names.index(n) for n in foot_body_names]
+        self._sensor_num_bodies = sensor.num_bodies
+        self._sole_local = torch.tensor(self.SOLE_CENTRE, device=device, dtype=torch.float32)
+
+    def __call__(
+        self,
+        env: ManagerBasedRLEnv,
+        command_name: str,
+        sensor_name: str,
+        foot_body_names: tuple[str, ...] = ("left_foot_link", "right_foot_link"),
+        free_radius: float = 0.05,
+        scale: float = 0.05,
+        min_load: float = 5.0,
+    ) -> torch.Tensor:
+        command: MotionCommand = env.command_manager.get_term(command_name)
+        sensor: ContactSensor = env.scene.sensors[sensor_name]
+        if self._stance is None:
+            self._setup(command, sensor, foot_body_names)
+
+        eps = 1e-6
+        c_ref = self._stance[command.time_steps].float()  # (N, F); index 0 is "left" for load_imbalance's sign
+
+        robot = env.scene["robot"]
+        foot_pos_w = robot.data.body_pos_w[:, self._robot_foot_ids]  # (N, F, 3), simulated
+        foot_quat_w = robot.data.body_quat_w[:, self._robot_foot_ids]
+        sole_local = self._sole_local.view(1, 1, 3).expand_as(foot_pos_w)
+        p_foot_xy = (foot_pos_w + quat_apply(foot_quat_w, sole_local))[..., :2]  # (N, F, 2)
+        p_support = (c_ref[..., None] * p_foot_xy).sum(1) / (c_ref.sum(1, keepdim=True) + eps)  # (N, 2)
+
+        forces, points, _, _, count, start = sensor.contact_physx_view.get_contact_data(dt=env.physics_dt)
+        # The contact buffer is shared by all (env, foot) rows, sized max_contact_data_count_per_prim * rows;
+        # PhysX truncates once the *total* fills it, so that -- not any one row's count -- is what to check.
+        if not self._budget_warned and self._calls % self.BUDGET_CHECK_EVERY == 0:
+            total = int(count.sum())
+            if total >= forces.shape[0]:
+                print(
+                    f"[WARN] CoPSupportCentering: {total} foot-ground contact points filled the {forces.shape[0]}"
+                    "-slot contact buffer -- contacts may be silently truncated, biasing the CoP. Consider raising"
+                    " max_contact_data_count_per_prim on 'foot_ground_contact'."
+                )
+                self._budget_warned = True
+        self._calls += 1
+        sum_force, sum_force_pos = _weighted_contact_agg(forces, points, count[:, 0], start[:, 0])
+
+        env_offset = torch.arange(env.num_envs, device=self.device) * self._sensor_num_bodies
+        Fz = torch.stack([sum_force[env_offset + bid] for bid in self._sensor_body_ids], dim=1)  # (N, F)
+        sum_pos_xy = torch.stack(
+            [sum_force_pos[env_offset + bid, :2] for bid in self._sensor_body_ids], dim=1
+        )  # (N, F, 2)
+
+        Fz_total = Fz.sum(1)
+        p_cop = sum_pos_xy.sum(1) / (Fz_total[:, None] + eps)  # (N, 2)
+
+        d = torch.norm(p_cop - p_support, dim=-1)
+        active = (c_ref.sum(1) > 0) & (Fz_total > min_load)
+        excess = torch.clamp(d - free_radius, min=0.0)
+        penalty = (excess / scale) * active.float()
+
+        # Heading-frame decomposition, for logging only: forward = toe-ward, so a systematic bias there is the
+        # direct diagnostic for the hardware heel/toe-lift issue this term is meant to address.
+        anchor_quat = command.robot_anchor_quat_w
+        w, x, y, z = anchor_quat.unbind(-1)
+        heading = torch.atan2(2 * (w * z + x * y), 1 - 2 * (y * y + z * z))
+        offset = p_cop - p_support
+        cos_h, sin_h = torch.cos(heading), torch.sin(heading)
+        forward = offset[:, 0] * cos_h + offset[:, 1] * sin_h
+        lateral = -offset[:, 0] * sin_h + offset[:, 1] * cos_h
+
+        # Masked accumulation rather than boolean indexing: indexing needs the mask's count on the host.
+        double = ((c_ref[:, 0] > 0) & (c_ref[:, 1] > 0) & active).float()
+        imbalance = (Fz[:, 0] - Fz[:, 1]) / (Fz_total + eps)
+        self.imbalance_sum += imbalance * double
+        self.imbalance_count += double
+
+        mask = active.float()
+        self.step_count += 1.0
+        self.active_count += mask
+        for name, value in zip(self.TERMS, (d, excess, penalty, forward, lateral)):
+            self.sums[name] += value * mask
+        self.counts += mask
+
+        return penalty
+
+
+# Sole corners in the foot-link frame (m), from meshes/Left_Foot.STL: the sole's flat bottom sits at z = -0.0382 and
+# spans x -0.065..0.094, y -0.039..0.041. The toe corners at x 0.0995 are ~6 mm past the end of the flat face, where
+# the toe starts to curl, so they read a mm or two high on a flat foot -- well inside the dead zone below. Order:
+# toe-outer, toe-inner, heel-outer, heel-inner; "outer" is +y on the left foot, so the right foot mirrors y.
+SOLE_CORNERS_LEFT = ((0.0995, 0.04, -0.0382), (0.0995, -0.04, -0.0382), (-0.0657, 0.04, -0.0382), (-0.0657, -0.04, -0.0382))
+SOLE_CORNER_NAMES = ("toe_out", "toe_in", "heel_out", "heel_in")
+
+
+def sole_corner_heights(foot_pos_w: torch.Tensor, foot_quat_w: torch.Tensor, corners: torch.Tensor) -> torch.Tensor:
+    """Height above the floor (z = 0, flat ground) of each sole corner: ``(..., F, 4)`` from ``(..., F, 3/4)`` foot
+    poses and ``(F, 4, 3)`` corners in each foot's own frame."""
+    quat = foot_quat_w[..., None, :].expand(*foot_quat_w.shape[:-1], corners.shape[-2], 4)
+    points = foot_pos_w[..., None, :] + quat_apply(quat, corners.expand(*foot_pos_w.shape[:-1], -1, -1))
+    return points[..., 2]
+
+
+class FootFlatStance(ManagerTermBase):
+    r"""Penalizes a stance foot that is not flat on the floor: any of its four sole corners lifted.
+
+    Per foot :math:`f`, with sole-corner heights :math:`h_{f,c}` of the *simulated* foot and reference stance
+    :math:`s_f` (:func:`reference_stance`):
+
+    .. math::
+        e_{f,c} &= \max(h_{f,c} - tol,\, 0) \\
+        \text{score}_f &= \exp\Big(-\sum_c e_{f,c}^2 / \sigma^2\Big) \\
+        \text{penalty} &= \frac{\sum_f s_f\,(1 - \text{score}_f)}{\max(\sum_f s_f,\, 1)}
+
+    so it is 0 for flat stance feet, approaches 1 for a stance foot up on its heel, toe or edge, and is exactly 0
+    on swing feet and in flight -- the stance gate is the whole point, so no separate gain is needed: the term's
+    weight *is* the stance-frame gain, and unlike ``HandObjectInteraction`` there is no constant outside the gate
+    for a gain to be measured against.
+
+    The reference is deliberately not the target. Its own feet are rolled onto the inner edge (outer corners
+    15-25 mm up) and hover ~1 cm on the standing frames, so the reference itself scores 0.1-0.3 here; this term asks
+    for flat feet anyway, which is why ``motion_foot_ori`` is turned down alongside it.
+
+    Not gated by ``_object_absent``: like ``CoPSupportCentering``, it is about the feet, not the object.
+    """
+
+    TERMS = ("score", "penalty") + tuple(f"h_{name}" for name in SOLE_CORNER_NAMES)
+
+    def __init__(self, cfg: RewardTermCfg, env: ManagerBasedRLEnv):
+        super().__init__(cfg, env)
+        self._stance: torch.Tensor | None = None
+        self._robot_foot_ids: list[int] | None = None
+        self._corners: torch.Tensor | None = None
+        self.sums = {name: torch.zeros(self.num_envs, device=self.device) for name in self.TERMS}
+        self.counts = torch.zeros(self.num_envs, device=self.device)  # stance foot-steps
+        self.steps = torch.zeros(self.num_envs, device=self.device)
+        self.stance_steps = torch.zeros(self.num_envs, device=self.device)
+
+    def reset(self, env_ids: Sequence[int] | None = None) -> None:
+        """Log episode means over stance foot-steps only; swing feet are not judged and would just dilute them."""
+        ids = slice(None) if env_ids is None else env_ids
+        log = self._env.extras.setdefault("log", {})
+        counts = self.counts[ids]
+        seen = counts > 0
+        for name in self.TERMS:
+            if seen.any():
+                log[f"FootFlat/{name}"] = (self.sums[name][ids][seen] / counts[seen]).mean()
+            self.sums[name][ids] = 0.0
+        steps = self.steps[ids]
+        if (steps > 0).any():
+            log["FootFlat/stance_frac"] = (self.stance_steps[ids][steps > 0] / steps[steps > 0]).mean()
+        self.counts[ids] = 0.0
+        self.steps[ids] = 0.0
+        self.stance_steps[ids] = 0.0
+
+    def __call__(
+        self,
+        env: ManagerBasedRLEnv,
+        command_name: str,
+        foot_body_names: tuple[str, str] = ("left_foot_link", "right_foot_link"),
+        tol: float = 0.004,
+        sigma: float = 0.015,
+    ) -> torch.Tensor:
+        command: MotionCommand = env.command_manager.get_term(command_name)
+        if self._stance is None:
+            self._stance, labelled = reference_stance(command, foot_body_names)
+            self._robot_foot_ids = [env.scene["robot"].body_names.index(n) for n in foot_body_names]
+            left = torch.tensor(SOLE_CORNERS_LEFT, device=self.device)
+            self._corners = torch.stack([left, left * torch.tensor([1.0, -1.0, 1.0], device=self.device)])
+            print(f"[FootFlatStance] stance from baked labels on {labelled.float().mean().item() * 100:.0f}% of reference"
+                  " frames, kinematic guess on the rest")
+
+        robot = env.scene["robot"]
+        h = sole_corner_heights(
+            robot.data.body_pos_w[:, self._robot_foot_ids], robot.data.body_quat_w[:, self._robot_foot_ids], self._corners
+        )  # (N, F, 4)
+        score = torch.exp(-(torch.clamp(h - tol, min=0.0) ** 2).sum(-1) / sigma**2)  # (N, F)
+        stance = self._stance[command.time_steps].float()  # (N, F)
+        n_stance = stance.sum(1)
+        penalty = (stance * (1.0 - score)).sum(1) / n_stance.clamp(min=1.0)
+
+        self.steps += 1.0
+        self.stance_steps += (n_stance > 0).float()
+        self.counts += n_stance
+        self.sums["score"] += (stance * score).sum(1)
+        self.sums["penalty"] += (stance * (1.0 - score)).sum(1)
+        for c, name in enumerate(SOLE_CORNER_NAMES):
+            self.sums[f"h_{name}"] += (stance * h[..., c]).sum(1)
+        return penalty

@@ -14,7 +14,8 @@ fixed fps, with the layout built by ``_make_obs_layout(num_bodies, num_dof)``::
     obj_lin_vel   [20+2*ND : 23+2*ND]         world frame, m/s
     obj_ang_vel   [23+2*ND : 26+2*ND]         world frame, rad/s
     body_*        [26+2*ND : 26+2*ND+13*NB]   ignored, regenerated from the Booster model
-    contact       trailing NB                 per-body 0/1; CONTACT_CHANNELS carried through
+    contact       trailing NB                 per-body 0/1; CONTACT_CHANNELS carried through, and
+                                              STANCE_CHANNELS as ``stance`` when the file has them
 
 The object block is carried straight through to the output npz (as ``object_pos_w``,
 ``object_quat_w``, ``object_lin_vel_w``, ``object_ang_vel_w``): unlike the robot body block,
@@ -152,6 +153,41 @@ parser.add_argument(
         " ankles -0.10, arms down) -- the pose the real robot starts from. 'default': BOOSTER_K1_CFG default joint"
         " angles (straight legs)."
     ),
+)
+parser.add_argument(
+    "--end_mode",
+    choices=["stand", "settle"],
+    default="stand",
+    help=(
+        "What the --stand_s transition ends in. 'stand': let go of the object and go to --stand_pose. 'settle': keep"
+        " holding it -- arms and head frozen at the clip's last pose, the object carried rigidly with the trunk, hand"
+        " contact kept on -- while the legs settle into a stable stance: the foot in stance at the clip end stays"
+        " pinned, the trunk turns to face along it and leans --settle_lean_deg forward, both hips straighten in"
+        " yaw/roll, knees bend to --settle_knee, and the ankles are solved so both soles end flat on the floor."
+    ),
+)
+parser.add_argument("--settle_knee", type=float, default=0.35, help="Knee bend at the end of --end_mode settle, rad.")
+parser.add_argument(
+    "--settle_stance_leg",
+    choices=["keep", "straighten"],
+    default="keep",
+    help=(
+        "--end_mode settle: what the stance (pinned) leg does in yaw/roll. 'keep': its hip yaw and roll stay at the"
+        " clip's last values, so the loaded foot never rotates on the floor (only its pitch/roll flatten). 'straighten':"
+        " hip yaw/roll go to 0 like the swing leg, which pivots the loaded foot in place when the trunk heading is kept."
+    ),
+)
+parser.add_argument(
+    "--settle_heading",
+    choices=["trunk", "foot"],
+    default="trunk",
+    help=(
+        "Final trunk heading for --end_mode settle. 'trunk': keep the clip's last trunk heading -- the stance foot"
+        " pivots in place to line up with it. 'foot': turn the trunk to face along the stance foot instead."
+    ),
+)
+parser.add_argument(
+    "--settle_lean_deg", type=float, default=8.0, help="Forward trunk lean at the end of --end_mode settle, degrees."
 )
 parser.add_argument(
     "--start_s",
@@ -324,6 +360,14 @@ CONTACT_CHANNELS = [(6, "left_hand_link"), (11, "right_hand_link")]
 CONTACT_SOURCE_INDEXES = [index for index, _ in CONTACT_CHANNELS]
 CONTACT_NAMES = [name for _, name in CONTACT_CHANNELS]
 
+# Per-foot reference stance (floor support, 0/1), carried into the npz as ``stance`` -- kept apart from ``contact``,
+# which is the hand-object gate and has exactly one channel per hand. Newer exports overwrite the contact bits of
+# both each foot link and its sphere_5 toe link with that foot's stance, so the two columns are identical; older
+# exports hold unrelated sim contact bits there. That equality is how the format is recognised, and a file without
+# it gets no ``stance`` key rather than a mislabelled one. As (foot link index, its toe-sphere index, K1 body name).
+STANCE_CHANNELS = [(18, 19, "left_foot_link"), (25, 26, "right_foot_link")]
+STANCE_NAMES = [name for _, _, name in STANCE_CHANNELS]
+
 
 @configclass
 class ReplayMotionsSceneCfg(InteractiveSceneCfg):
@@ -425,7 +469,18 @@ class InterMimicMotionLoader:
 
         # Per-body contact flags trail the body block. 6 = left_hand_link, 11 = right_hand_link:
         # verified against the object trajectory (on at grasp, off together at set-down).
-        self.motion_contacts = motion[:, body_start + 13 * nb : body_start + 14 * nb][:, CONTACT_SOURCE_INDEXES]
+        contact_block = motion[:, body_start + 13 * nb : body_start + 14 * nb]
+        self.motion_contacts = contact_block[:, CONTACT_SOURCE_INDEXES]
+
+        self.motion_stance = None
+        if nb > max(toe for _, toe, _ in STANCE_CHANNELS) and all(
+            torch.equal(contact_block[:, foot], contact_block[:, toe]) for foot, toe, _ in STANCE_CHANNELS
+        ):
+            self.motion_stance = contact_block[:, [foot for foot, _, _ in STANCE_CHANNELS]].clone()
+            share = ", ".join(f"{n} {v * 100:.1f}%" for n, v in zip(STANCE_NAMES, self.motion_stance.mean(0).tolist()))
+            print(f"[STANCE]: per-foot stance labels found ({share} of frames); writing them as 'stance'")
+        else:
+            print("[STANCE]: no per-foot stance labels in this file (foot and toe-sphere columns differ); no 'stance' key")
 
         quat_norm = self.motion_base_rots.norm(dim=-1)
         if not torch.allclose(quat_norm, torch.ones_like(quat_norm), atol=1e-3):
@@ -459,6 +514,7 @@ class InterMimicMotionLoader:
             self.motion_object_ang_vels[self.current_idx : self.current_idx + 1],
             self.motion_contacts[self.current_idx : self.current_idx + 1],
         )
+        self.last_idx = self.current_idx
         self.current_idx += 1
         reset_flag = False
         if self.current_idx >= self.output_frames:
@@ -599,7 +655,14 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
             motion, robot, robot_joint_indexes, sim, scene, foot_ids
         )
     if args_cli.stand_s > 0:
-        stand_start = append_stand_transition(motion, robot, robot_joint_indexes)
+        if args_cli.end_mode == "settle":
+            stand_start = append_settle_transition(motion, robot, robot_joint_indexes, sim, scene, foot_ids)
+        else:
+            stand_start = append_stand_transition(motion, robot, robot_joint_indexes)
+    settle = args_cli.end_mode == "settle" and stand_start is not None
+    global SETTLE_SOLE_CORNERS
+    SETTLE_SOLE_CORNERS = SETTLE_SOLE_CORNERS.to(sim.device)
+    last_root = last_obj = prev_obj = None  # clip's last root and object pose (settle mode), captured in the loop
     contact_targets = None
     if args_cli.show_contact_points:
         contact_targets = precompute_contact_targets(motion, robot, sim, scene, palm_ids, palm_offsets)
@@ -636,6 +699,7 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
         "joint_names": np.array(robot.joint_names),
         "body_names": np.array(robot.body_names),
         "contact_names": np.array(CONTACT_NAMES),
+        **({"stance": [], "stance_names": np.array(STANCE_NAMES)} if motion.motion_stance is not None else {}),
         "object_name": np.array(args_cli.object),
     }
     file_saved = False
@@ -726,8 +790,20 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
                 robot.update(0.0)
                 feet = robot.data.body_pos_w[0, foot_ids]
                 shift = torch.zeros(3, device=sim.device)
-                shift[:2] = synthetic_ref[:, :2].mean(0) - feet[:, :2].mean(0)
-                shift[2] = synthetic_ref[:, 2].min() - feet[:, 2].min()
+                pin = getattr(motion, "settle_pin", None) if frame >= (stand_start or 0) and settle else None
+                if pin is not None:
+                    # Settle: the stance foot stays where the clip left it in xy (the other one moves), and the root
+                    # height keeps that foot's lowest sole corner on the floor -- pinning the foot link's height
+                    # instead would leave a foot that flattens from a rolled edge hovering. The moving foot is not
+                    # used: it starts mid-step, tipped toe-down, and would lift the stance foot off the ground.
+                    shift[:2] = synthetic_ref[pin, :2] - feet[pin, :2]
+                    corners = robot.data.body_pos_w[0, foot_ids][:, None, :] + quat_apply(
+                        robot.data.body_quat_w[0, foot_ids][:, None, :].expand(2, 4, 4), SETTLE_SOLE_CORNERS
+                    )
+                    shift[2] = -corners[pin, :, 2].min()
+                else:
+                    shift[:2] = synthetic_ref[:, :2].mean(0) - feet[:, :2].mean(0)
+                    shift[2] = synthetic_ref[:, 2].min() - feet[:, 2].min()
                 root_states[:, :3] += shift
                 if prev_root is not None:
                     dt = 1.0 / args_cli.output_fps
@@ -738,6 +814,20 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
                 robot.write_root_state_to_sim(root_states)
                 robot.write_joint_state_to_sim(joint_pos, joint_vel)
             prev_root = root_states.clone()
+
+        if settle and len(log["joint_pos"]) >= stand_start and last_root is not None:
+            # Carry the object rigidly with the trunk: T_obj = T_root_now * T_root_last^-1 * T_obj_last.
+            root_pos_now = root_states[0, :3] - torch.cat([scene.env_origins[0, :2], scene.env_origins.new_zeros(1)])
+            rel_q = quat_mul(root_states[:1, 3:7], quat_conjugate(last_root[1][None]))
+            motion_object_pos = (root_pos_now + quat_apply(rel_q, (last_obj[0] - last_root[0])[None])[0])[None]
+            motion_object_rot = quat_mul(rel_q, last_obj[1][None])
+            if prev_obj is not None:
+                dt = 1.0 / args_cli.output_fps
+                motion_object_lin_vel = (motion_object_pos - prev_obj[0]) / dt
+                dq = quat_mul(motion_object_rot, quat_conjugate(prev_obj[1]))
+                dq = torch.where(dq[:, :1] < 0, -dq, dq)
+                motion_object_ang_vel = 2.0 * dq[:, 1:] / dt
+            prev_obj = (motion_object_pos.clone(), motion_object_rot.clone())
 
         # set object state (kinematic replay, same convention as the robot root above)
         if not args_cli.object_physics:
@@ -815,6 +905,11 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
             sim.physics_sim_view.update_articulations_kinematic()
             robot.update(0.0)
             feet_ref = robot.data.body_pos_w[0, foot_ids].clone()
+            if settle:
+                origin = torch.cat([scene.env_origins[0, :2], scene.env_origins.new_zeros(1)])
+                last_root = (root_states[0, :3] - origin, root_states[0, 3:7].clone())
+                last_obj = (motion_object_pos[0].clone(), motion_object_rot[0].clone())
+                prev_obj = (motion_object_pos.clone(), motion_object_rot.clone())
         if not file_saved:
             log["joint_pos"].append(robot.data.joint_pos[0, :].cpu().numpy().copy())
             log["joint_vel"].append(robot.data.joint_vel[0, :].cpu().numpy().copy())
@@ -834,6 +929,8 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
                 log["object_lin_vel_w"].append(motion_object_lin_vel[0, :].cpu().numpy().copy())
                 log["object_ang_vel_w"].append(motion_object_ang_vel[0, :].cpu().numpy().copy())
             log["contact"].append(motion_contact[0, :].cpu().numpy().copy())
+            if motion.motion_stance is not None:
+                log["stance"].append(motion.motion_stance[motion.last_idx].cpu().numpy().copy())
 
         if reset_flag and not file_saved:
             file_saved = True
@@ -849,6 +946,7 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
                 "object_lin_vel_w",
                 "object_ang_vel_w",
                 "contact",
+                *(("stance",) if motion.motion_stance is not None else ()),
             ):
                 log[k] = np.stack(log[k], axis=0)
 
@@ -943,6 +1041,8 @@ def prepend_start_transition(
     prepend("motion_object_lin_vels", torch.zeros(steps, 3, device=dev))
     prepend("motion_object_ang_vels", torch.zeros(steps, 3, device=dev))
     prepend("motion_contacts", torch.zeros(steps, motion.motion_contacts.shape[1], device=dev))
+    if motion.motion_stance is not None:
+        prepend("motion_stance", torch.ones(steps, motion.motion_stance.shape[1], device=dev))  # stood on both feet
     motion.output_frames += steps
     motion.lead_frames = steps
     print(
@@ -1068,10 +1168,269 @@ def append_stand_transition(motion: "InterMimicMotionLoader", robot, robot_joint
     extend("motion_object_lin_vels", torch.zeros(steps, 3, device=dev))
     extend("motion_object_ang_vels", torch.zeros(steps, 3, device=dev))
     extend("motion_contacts", torch.zeros(steps, motion.motion_contacts.shape[1], device=dev))
+    if motion.motion_stance is not None:
+        extend("motion_stance", torch.ones(steps, motion.motion_stance.shape[1], device=dev))  # stood on both feet
     motion.output_frames = n + steps
     print(
         f"[STAND]: appended {steps} frames ({duration:.2f} s) from the last pose to the '{args_cli.stand_pose}' standing pose;"
         f" max joint change {(q1 - q0).abs().max().item():.3f} rad, clip end joint speed {v0.abs().max().item():.3f} rad/s",
+        flush=True,
+    )
+    return n
+
+
+# Sole corners in each foot link's frame (left, right), from meshes/{Left,Right}_Foot.STL: the flat sole is at
+# z = -0.0382; toe-outer, toe-inner, heel-outer, heel-inner, outer = +y on the left foot.
+_SOLE_LEFT = [[0.0995, 0.04, -0.0382], [0.0995, -0.04, -0.0382], [-0.0657, 0.04, -0.0382], [-0.0657, -0.04, -0.0382]]
+SETTLE_SOLE_CORNERS = torch.tensor([_SOLE_LEFT, [[x, -y, z] for x, y, z in _SOLE_LEFT]])
+
+
+def _foot_up_error(robot, sim, foot_ids: list[int], heading_quat: torch.Tensor) -> torch.Tensor:
+    """(2 feet, 2): each sole's up axis in the heading frame's x/y -- zero when the foot is flat."""
+    sim.physics_sim_view.update_articulations_kinematic()
+    robot.update(0.0)
+    up = quat_apply(robot.data.body_quat_w[0, foot_ids], torch.tensor([[0.0, 0.0, 1.0]], device=sim.device).expand(2, 3))
+    local = quat_apply(quat_conjugate(heading_quat).expand(2, 4), up)
+    return local[:, :2]
+
+
+def append_settle_transition(
+    motion: "InterMimicMotionLoader", robot, robot_joint_indexes: list[int], sim, scene, foot_ids: list[int]
+) -> int:
+    """Extend the motion with a hold-the-object settle into a stable stance (``--end_mode settle``); returns its
+    first frame.
+
+    Arms and head are frozen at the clip's last pose, and the object is carried rigidly with the trunk (applied in
+    the bake loop), so the grasp is unchanged. The legs go, by cubic Hermite from the clip's final joint state to
+    rest, into: hip yaw and roll 0, knee ``--settle_knee``, hip pitch ``-(knee / 2 + lean)``, and ankle pitch/roll
+    solved (Newton, finite differences on FK) so each sole is flat. The root slerps to the heading of the foot that
+    is in stance on the clip's last frame (``--settle_heading foot``) or keeps the clip's last trunk heading (``trunk``,
+    the default; the stance foot then pivots in place), pitched ``--settle_lean_deg`` forward; the bake loop pins that foot
+    where it was, so the other foot is the one that moves and lands beside it. Hand contact stays as on the last
+    frame; stance is the last frame's until the final 30% of the transition, then both feet.
+    """
+    fps = motion.output_fps
+    n = motion.output_frames
+    steps = max(int(round(args_cli.stand_s * fps)), 1)
+    duration = steps / fps
+    dev = motion.motion_dof_poss.device
+    names = [aliases[0] for aliases in K1_DOF_ALIASES]
+    q0, v0 = motion.motion_dof_poss[-1].clone(), motion.motion_dof_vels[-1].clone()
+
+    # Pinned foot: the one in stance on the last frame (the other is mid-step), or none if both / neither.
+    pin = None
+    if motion.motion_stance is not None:
+        last = motion.motion_stance[-1] > 0.5
+        if bool(last[0]) != bool(last[1]):
+            pin = 0 if bool(last[0]) else 1
+
+    # FK of the last frame: the pinned foot's heading sets the final trunk heading.
+    root_states = robot.data.default_root_state.clone()
+    root_states[:, :3] = motion.motion_base_poss[-1]
+    root_states[:, :2] += scene.env_origins[:, :2]
+    root_states[:, 3:7] = motion.motion_base_rots[-1]
+    root_states[:, 7:] = 0.0
+    robot.write_root_state_to_sim(root_states)
+    joint_pos = robot.data.default_joint_pos.clone()
+    joint_pos[:, robot_joint_indexes] = q0
+    robot.write_joint_state_to_sim(joint_pos, torch.zeros_like(joint_pos))
+    sim.physics_sim_view.update_articulations_kinematic()
+    robot.update(0.0)
+
+    def yaw_of(q: torch.Tensor) -> float:
+        w, x, y, z = q.tolist()
+        return math.atan2(2 * (w * z + x * y), 1 - 2 * (y * y + z * z))
+
+    if args_cli.settle_heading == "foot" and pin is not None:
+        yaw = yaw_of(robot.data.body_quat_w[0, foot_ids[pin]])
+    else:
+        yaw = yaw_of(motion.motion_base_rots[-1])
+    lean = math.radians(args_cli.settle_lean_deg)
+    heading = torch.tensor([math.cos(yaw / 2), 0.0, 0.0, math.sin(yaw / 2)], device=dev)
+    pitch = torch.tensor([math.cos(lean / 2), 0.0, math.sin(lean / 2), 0.0], device=dev)  # +y: nose down
+    rot1 = quat_mul(heading[None], pitch[None])[0]
+
+    # Target leg pose; ankles then solved for flat soles with the root at its target orientation.
+    k = args_cli.settle_knee
+    q1 = q0.clone()
+    for f_idx, side in enumerate(("Left", "Right")):
+        if not (args_cli.settle_stance_leg == "keep" and pin == f_idx):
+            q1[names.index(f"{side}_Hip_Yaw")] = 0.0
+            q1[names.index(f"{side}_Hip_Roll")] = 0.0
+        q1[names.index(f"{side}_Knee_Pitch")] = k
+        q1[names.index(f"{side}_Hip_Pitch")] = -(k / 2 + lean)
+        q1[names.index(f"{side}_Ankle_Pitch")] = -k / 2
+        q1[names.index(f"{side}_Ankle_Roll")] = 0.0
+    ankle = [[names.index(f"{side}_Ankle_Pitch"), names.index(f"{side}_Ankle_Roll")] for side in ("Left", "Right")]
+    root_states[:, 3:7] = rot1
+    robot.write_root_state_to_sim(root_states)
+
+    def err_at(q: torch.Tensor) -> torch.Tensor:
+        jp = robot.data.default_joint_pos.clone()
+        jp[:, robot_joint_indexes] = q
+        robot.write_joint_state_to_sim(jp, torch.zeros_like(jp))
+        return _foot_up_error(robot, sim, foot_ids, heading)
+
+    for _ in range(8):
+        e = err_at(q1)
+        if e.abs().max() < 1e-4:
+            break
+        for f in range(2):
+            jac = torch.zeros(2, 2, device=dev)
+            for c in range(2):
+                dq = q1.clone()
+                dq[ankle[f][c]] += 1e-3
+                jac[:, c] = (err_at(dq)[f] - e[f]) / 1e-3
+            q1[ankle[f]] -= torch.linalg.solve(jac, e[f])
+    tilt = torch.rad2deg(torch.asin(err_at(q1).norm(dim=-1).clamp(max=1.0)))
+    print(f"[SETTLE]: target ankles L pitch/roll {q1[ankle[0]].tolist()} R {q1[ankle[1]].tolist()}; "
+          f"residual sole tilt {tilt.tolist()} deg", flush=True)
+
+    # Legs: Hermite (q0, v0) -> (q1, 0). Arms and head: frozen at q0, at rest.
+    legs = torch.tensor([i for i, nm in enumerate(names) if "Hip" in nm or "Knee" in nm or "Ankle" in nm], device=dev)
+    u = (torch.arange(1, steps + 1, device=dev, dtype=torch.float32) / steps).unsqueeze(-1)
+    h00, h10, h01 = 2 * u**3 - 3 * u**2 + 1, u**3 - 2 * u**2 + u, -2 * u**3 + 3 * u**2
+    d00, d10, d01 = 6 * u**2 - 6 * u, 3 * u**2 - 4 * u + 1, -6 * u**2 + 6 * u
+    dof_pos = q0.expand(steps, -1).clone()
+    dof_vel = torch.zeros(steps, len(names), device=dev)
+    dof_pos[:, legs] = (h00 * q0 + h10 * duration * v0 + h01 * q1)[:, legs]
+    dof_vel[:, legs] = ((d00 * q0 + d10 * duration * v0 + d01 * q1) / duration)[:, legs]
+
+    rot0 = motion.motion_base_rots[-1]
+    if torch.dot(rot0, rot1) < 0:
+        rot1 = -rot1
+    sm = 3 * u**2 - 2 * u**3
+    angle = torch.acos(torch.clamp(torch.dot(rot0, rot1), -1.0, 1.0))
+    if angle < 1e-6:
+        rots = rot0.expand(steps, 4).clone()
+    else:
+        rots = (torch.sin((1 - sm) * angle) * rot0 + torch.sin(sm * angle) * rot1) / torch.sin(angle)
+
+    # Keep the soles from tipping mid-transition: joint-space interpolation alone rolls them onto their toes while
+    # the trunk turns and leans. Per frame, solve the ankles so each sole's up axis follows a smoothstep blend from
+    # its clip-end tilt to vertical (world frame).
+    root_states[:, 3:7] = rot0
+    robot.write_root_state_to_sim(root_states)
+    jp = robot.data.default_joint_pos.clone()
+    jp[:, robot_joint_indexes] = q0
+    robot.write_joint_state_to_sim(jp, torch.zeros_like(jp))
+    world = torch.tensor([1.0, 0.0, 0.0, 0.0], device=dev)
+    sole = SETTLE_SOLE_CORNERS.to(dev)
+    up_start = _foot_up_error(robot, sim, foot_ids, world)  # (2, 2): x/y of each sole's up axis at the clip end
+    clear_start = None
+    clearance_at_start = 0.0
+    if pin is not None:
+        pts0 = robot.data.body_pos_w[0, foot_ids][:, None, :] + quat_apply(
+            robot.data.body_quat_w[0, foot_ids][:, None, :].expand(2, 4, 4), sole
+        )
+        clearance_at_start = pts0[1 - pin, :, 2].min() - pts0[pin, :, 2].min()
+    for f in range(steps):
+        root_states[:, 3:7] = rots[f]
+        robot.write_root_state_to_sim(root_states)
+        target = (1.0 - sm[f]) * up_start
+        q = dof_pos[f].clone()
+
+        def err_q(qq: torch.Tensor) -> torch.Tensor:
+            jq = robot.data.default_joint_pos.clone()
+            jq[:, robot_joint_indexes] = qq
+            robot.write_joint_state_to_sim(jq, torch.zeros_like(jq))
+            return _foot_up_error(robot, sim, foot_ids, world) - target
+
+        for _ in range(4):
+            e = err_q(q)
+            if e.abs().max() < 1e-4:
+                break
+            for side in range(2):
+                jac = torch.zeros(2, 2, device=dev)
+                for c in range(2):
+                    dq = q.clone()
+                    dq[ankle[side][c]] += 1e-3
+                    jac[:, c] = (err_q(dq)[side] - e[side]) / 1e-3
+                q[ankle[side]] -= torch.linalg.solve(jac, e[side])
+        # Swing-foot clearance: the bake loop keeps the pinned foot's lowest sole corner on the floor, so the
+        # other foot's lowest corner relative to it is its height above the floor. Where that is negative, shorten
+        # the swing leg -- more knee, half as much more hip flexion (keeps the foot under the hip) and half as much
+        # ankle the other way (hip + knee + ankle pitch unchanged, so the sole keeps its tilt; with the ankle fixed
+        # the knee bend tips the toe down and digs it further in) -- then re-solve its ankle, until it clears.
+        if pin is not None:
+            swing = 1 - pin
+            knee_i, hip_i = names.index(f"{('Left', 'Right')[swing]}_Knee_Pitch"), names.index(f"{('Left', 'Right')[swing]}_Hip_Pitch")
+
+            def clearance(qq: torch.Tensor) -> torch.Tensor:
+                jq = robot.data.default_joint_pos.clone()
+                jq[:, robot_joint_indexes] = qq
+                robot.write_joint_state_to_sim(jq, torch.zeros_like(jq))
+                sim.physics_sim_view.update_articulations_kinematic()
+                robot.update(0.0)
+                pts = robot.data.body_pos_w[0, foot_ids][:, None, :] + quat_apply(
+                    robot.data.body_quat_w[0, foot_ids][:, None, :].expand(2, 4, 4), sole
+                )
+                return pts[swing, :, 2].min() - pts[pin, :, 2].min()
+
+            def shortened(delta: float) -> torch.Tensor:
+                qq = q.clone()
+                qq[knee_i] += delta
+                qq[hip_i] -= delta / 2
+                qq[ankle[swing][0]] -= delta / 2
+                for _ in range(3):
+                    e = err_q(qq)
+                    jac = torch.zeros(2, 2, device=dev)
+                    for c in range(2):
+                        dq = qq.clone()
+                        dq[ankle[swing][c]] += 1e-3
+                        jac[:, c] = (err_q(dq)[swing] - e[swing]) / 1e-3
+                    qq[ankle[swing]] -= torch.linalg.solve(jac, e[swing])
+                return qq
+
+            # Smallest shortening that reaches the clearance target: bracket by doubling, then bisect, so the
+            # correction varies smoothly frame to frame instead of overshooting the way a linearised step does.
+            # The target eases from wherever the clip left the swing foot (its toe can already be a few mm below
+            # the stance sole) up to +1 mm over the first 30% of the transition, so frame 0 does not jump.
+            if clear_start is None:
+                clear_start = float(clearance_at_start)
+            ramp = min(1.0, (f + 1) / max(1.0, 0.3 * steps))
+            margin = clear_start + (1e-3 - clear_start) * (3 * ramp**2 - 2 * ramp**3) if clear_start < 1e-3 else 1e-3
+            if clearance(q) < margin:
+                lo, hi = 0.0, 0.02
+                while clearance(shortened(hi)) < margin and hi < 1.0:
+                    lo, hi = hi, hi * 2
+                for _ in range(14):
+                    mid = 0.5 * (lo + hi)
+                    if clearance(shortened(mid)) < margin:
+                        lo = mid
+                    else:
+                        hi = mid
+                q = shortened(hi)
+        dof_pos[f] = q
+    # Velocities of the solved leg joints from the final positions, starting from the clip's last frame.
+    seq = torch.cat([q0[None], dof_pos], dim=0)[:, legs]
+    dof_vel[:, legs] = (seq[1:] - seq[:-1]) * fps
+
+    def extend(name: str, tail: torch.Tensor):
+        setattr(motion, name, torch.cat([getattr(motion, name), tail.to(getattr(motion, name).dtype)], dim=0))
+
+    extend("motion_dof_poss", dof_pos)
+    extend("motion_dof_vels", dof_vel)
+    extend("motion_base_rots", rots)
+    extend("motion_base_poss", motion.motion_base_poss[-1:].expand(steps, 3))
+    extend("motion_base_lin_vels", torch.zeros(steps, 3, device=dev))
+    extend("motion_base_ang_vels", torch.zeros(steps, 3, device=dev))
+    # Object placeholders: the bake loop overwrites them with the trunk-carried pose.
+    extend("motion_object_poss", motion.motion_object_poss[-1:].expand(steps, 3))
+    extend("motion_object_rots", motion.motion_object_rots[-1:].expand(steps, 4))
+    extend("motion_object_lin_vels", torch.zeros(steps, 3, device=dev))
+    extend("motion_object_ang_vels", torch.zeros(steps, 3, device=dev))
+    extend("motion_contacts", motion.motion_contacts[-1:].expand(steps, -1))
+    if motion.motion_stance is not None:
+        tail = motion.motion_stance[-1:].expand(steps, -1).clone()
+        tail[int(0.7 * steps):] = 1.0
+        extend("motion_stance", tail)
+    motion.output_frames = n + steps
+    motion.settle_pin = pin
+    print(
+        f"[SETTLE]: appended {steps} frames ({duration:.2f} s): holding the object, knee {k:.2f} rad, lean"
+        f" {args_cli.settle_lean_deg:.1f} deg, heading {math.degrees(yaw):.1f} deg, pinned foot"
+        f" {['left', 'right'][pin] if pin is not None else 'none (midpoint)'}",
         flush=True,
     )
     return n

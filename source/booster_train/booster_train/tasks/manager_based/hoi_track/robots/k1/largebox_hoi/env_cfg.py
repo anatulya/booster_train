@@ -3,11 +3,13 @@ import os
 
 import numpy as np
 
+from isaaclab.managers import EventTermCfg as EventTerm
 from isaaclab.managers import ObservationTermCfg as ObsTerm
+from isaaclab.managers import SceneEntityCfg
 from isaaclab.utils import configclass
 
 from booster_assets import BOOSTER_ASSETS_DIR
-from booster_train.assets.objects.boxes import CLIP_TOKEN_TO_OBJECT, OBJECT_CFGS, OBJECT_NAMES, object_link
+from booster_train.assets.objects.boxes import CLIP_TOKEN_TO_OBJECT, OBJECT_CFGS, OBJECT_NAMES, mesh_bounds, object_link
 from booster_train.assets.robots.booster import BOOSTER_K1_CFG as ROBOT_CFG, K1_ACTION_SCALE
 from booster_train.tasks.manager_based.hoi_track import mdp
 
@@ -179,6 +181,10 @@ class PlayFlatRefOnlyEnvCfg(FlatRefOnlyEnvCfg):
         super().__post_init__()
         self.commands.motion.play = True
         self.events.push_robot = None
+        # Nominal actuators (gains x1, full strength, no joint friction, default armature); play.py
+        # --actuator_stress restores actuator_dr with fixed worst-case values.
+        self.events.actuator_dr = None
+        self.events.joint_armature = None
         self.events.push_object = None
         self.events.object_scenario = None
         # No reset jitter either: a re-placed robot would otherwise start each rollout with a random kick and offset.
@@ -193,6 +199,10 @@ class PlayFlatWoStateEstimationEnvCfg(FlatWoStateEstimationEnvCfg):
         # In play mode each env starts at the first frame of a different clip, so one run shows every motion.
         self.commands.motion.play = True
         self.events.push_robot = None
+        # Nominal actuators (gains x1, full strength, no joint friction, default armature); play.py
+        # --actuator_stress restores actuator_dr with fixed worst-case values.
+        self.events.actuator_dr = None
+        self.events.joint_armature = None
         self.events.push_object = None
         self.events.object_scenario = None
         # No reset jitter either: a re-placed robot would otherwise start each rollout with a random kick and offset.
@@ -210,14 +220,95 @@ def clip_tag(path: str) -> str:
 
 SINGLE_CLIP_FILES = {clip_tag(path): path for path in ALL_MOTION_FILES}
 
+# Per-clip ObjectScenario overrides, merged over the tracking_env_cfg defaults. Grip strength is a property of
+# the policy trained on a clip, so the drop force has to be tuned per sequence.
+#
+# sub3_003_stand, from a sweep on its gain-10 fine-tune (model_35000, ~150 drops per config). The default
+# 3-5 x / 1.5 s left the grip holding on 23.8% of drops (median release 0.54 s). 5-8 x / 1.5 s: 14.5%.
+# 4-6 x / 2.5 s: 7.4%. 5-8 x / 2.5 s: 6.3%. 7-10 x / 1.5 s: 7.3%, releasing fastest (median 0.20 s, p90
+# 1.03 s). Falls after release stayed at 3-5% throughout, so the heavier push does not destabilise the robot.
+#
+# sub03_behave_boxlarge_000_stand, calibrated on the boxlarge policy: 2-4 x weight plus 40-80 N absolute (grip
+# friction does not scale with the box's weight), 1.0 s cap, drops 0.5-2.0 s into the episode. 82% of drop
+# episodes trigger, 97% of triggered drops release (median 0.14 s, p90 0.20 s), 0% hit the cap. The earlier
+# 3-5 x weight-only setting capped 17% of drops (40% on boxes under 0.5 kg).
+OBJECT_SCENARIO_OVERRIDES = {
+    "sub3_003_stand": {"force_scale_range": (7.0, 10.0), "max_force_s": 1.5},
+    "sub03_behave_boxlarge_000_stand": {
+        "force_scale_range": (2.0, 4.0),
+        "force_abs_range": (40.0, 80.0),
+        "release_steps": 5,
+        "max_force_s": 1.0,
+        "drop_delay_s": (0.5, 2.0),
+        "min_lift": 0.10,
+    },
+}
+
+# Real-world measured size (+/- jitter, applied per axis via a runtime USD scale before the sim starts) for a
+# clip's object, where the sim mesh's own baked size differs from the box that will actually be grasped on
+# hardware. See mdp.events.randomize_rigid_object_scale_and_store and MotionCommand.contact_point_local_scaled,
+# which together keep the hand-contact reward/termination's target on the resized surface rather than where the
+# original-size mesh's surface used to be.
+#
+# Both target_size and jitter are per object-local axis (x, y, z), in metres.
+#
+# sub1_suitcase_029_stand: real box measured 11.25 x 8.5 x 8.25 in, stood on end and gripped across the 8.5 in
+# side. suitcase_0539923's local axes, read off the reference: y is vertical while the box rests (native 28.7
+# cm -> 11.25 in), z is the axis between the two palms (native 22.3 cm -> 8.5 in), x is the remaining horizontal
+# side (native 22.1 cm -> 8.25 in). Every axis is within ~1 cm of native. Grip gets the widest jitter: a
+# narrower box than the reference's forces the hands to squeeze past their reference poses, which is the case
+# worth making robust; height and depth get less, height because it also shifts where the hands meet the box.
+#
+# Disabled: no clip currently resizes its object. Re-enable by restoring the entry below.
+OBJECT_SIZE_OVERRIDES = {
+    # "sub1_suitcase_029_stand": {
+    #     "target_size": (8.25 * 0.0254, 11.25 * 0.0254, 8.5 * 0.0254),
+    #     "jitter": (0.015, 0.015, 0.02),
+    # },
+}
+
+
+def apply_clip_overrides(cfg, tag: str) -> None:
+    """Merge per-clip overrides into ``cfg``: ``OBJECT_SCENARIO_OVERRIDES`` into the drop event, and
+    ``OBJECT_SIZE_OVERRIDES`` into a new per-axis object-scale event, both keyed by clip tag. Call after
+    ``set_object_from_motion()``, which this relies on for the object's identity."""
+    event = getattr(cfg.events, "object_scenario", None)
+    if event is not None and tag in OBJECT_SCENARIO_OVERRIDES:
+        event.params = {**event.params, **OBJECT_SCENARIO_OVERRIDES[tag]}
+
+    if tag in OBJECT_SIZE_OVERRIDES:
+        override = OBJECT_SIZE_OVERRIDES[tag]
+        target, jitter = override["target_size"], override["jitter"]
+        name = object_name_for(cfg.commands.motion.motion_file)
+        mins, maxs = mesh_bounds(name)
+        scale_range = {
+            axis: ((t - j) / (hi - lo), (t + j) / (hi - lo))
+            for axis, t, j, lo, hi in zip(("x", "y", "z"), target, jitter, mins, maxs)
+        }
+        # Per-env-different scale requires replicate_physics=False (isaaclab's own randomize_rigid_body_scale
+        # docstring); scoped to this clip's own scene cfg, so no other clip/task is affected.
+        cfg.scene.replicate_physics = False
+        cfg.events.object_scale = EventTerm(
+            func=mdp.randomize_rigid_object_scale_and_store,
+            mode="prestartup",
+            params={
+                "scale_range": scale_range,
+                "asset_cfg": SceneEntityCfg("object"),
+                "relative_child_path": object_link(name),
+                "mesh_bounds": (mins, maxs),
+            },
+        )
+
+
 for _tag, _path in SINGLE_CLIP_FILES.items():
     for _base in (FlatWoStateEstimationEnvCfg, PlayFlatWoStateEstimationEnvCfg, FlatRefOnlyEnvCfg, PlayFlatRefOnlyEnvCfg):
         _name = f"{_base.__name__}_{_tag}"
 
-        def _post_init(self, _base=_base, _path=_path):
+        def _post_init(self, _base=_base, _path=_path, _tag=_tag):
             _base.__post_init__(self)
             self.commands.motion.motion_file = _path
             self.set_object_from_motion()  # this clip may use a different object than the multi-clip default
+            apply_clip_overrides(self, _tag)
 
         _cls = type(_name, (_base,), {"__post_init__": _post_init, "__module__": __name__, "__qualname__": _name})
         globals()[_name] = configclass(_cls)

@@ -27,10 +27,10 @@ brings the opening of the clip up from rest rather than jumping to full speed of
 import argparse
 import numpy as np
 
-POSE_KEYS = ("joint_pos", "body_pos_w", "body_quat_w", "object_pos_w", "object_quat_w", "contact")
+POSE_KEYS = ("joint_pos", "body_pos_w", "body_quat_w", "object_pos_w", "object_quat_w", "contact", "stance")
 VELOCITY_KEYS = ("joint_vel", "body_lin_vel_w", "body_ang_vel_w", "object_lin_vel_w", "object_ang_vel_w")
 META_KEYS = ("fps", "joint_names", "body_names")
-OPTIONAL_META_KEYS = ("contact_names", "object_name")
+OPTIONAL_META_KEYS = ("contact_names", "stance_names", "object_name")
 
 
 QUAT_KEYS = ("body_quat_w", "object_quat_w")
@@ -59,8 +59,8 @@ def _consumed(ramp: int, profile: str, n: int) -> tuple[int, float]:
 def _resample(src: dict, tau: np.ndarray, rate: np.ndarray) -> dict:
     """Every motion channel sampled at fractional clip frames ``tau``, velocities scaled by the playback ``rate``.
 
-    Positions interpolate linearly, quaternions by normalised lerp along the shortest path, and the contact label
-    takes the nearest frame. Returned arrays are float64; callers cast back to the source dtype.
+    Positions interpolate linearly, quaternions by normalised lerp along the shortest path, and the contact and
+    stance labels take the nearest frame. Returned arrays are float64; callers cast back to the source dtype.
     """
     n = src["joint_pos"].shape[0]
     lo = np.clip(np.floor(tau).astype(int), 0, n - 1)
@@ -73,7 +73,7 @@ def _resample(src: dict, tau: np.ndarray, rate: np.ndarray) -> dict:
             continue
         data = src[key].astype(np.float64)
         w = frac.reshape((-1,) + (1,) * (data.ndim - 1))
-        if key == "contact":
+        if key in ("contact", "stance"):
             out[key] = data[np.rint(tau).astype(int).clip(0, n - 1)]
         elif key in QUAT_KEYS:
             a, b = data[lo], data[hi]
@@ -218,6 +218,10 @@ def main():
         # freeze the first pose before the clip and the final pose after it
         head = np.repeat(data[:1], pre, axis=0)
         hold = np.repeat(data[-1:], args.frames, axis=0)
+        if key == "stance":
+            # A held pose is standing still, so both feet are support -- even when the clip ends mid-step with a
+            # foot labelled swing. That keeps the flat-foot stance penalty acting on the lifted foot over the hold.
+            head, hold = np.ones_like(head), np.ones_like(hold)
         out[key] = np.concatenate([head, data, hold], axis=0)
     for key in VELOCITY_KEYS:
         if key not in src:

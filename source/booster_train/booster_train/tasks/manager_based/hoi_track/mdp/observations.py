@@ -250,13 +250,14 @@ def contact_target_b(env: ManagerBasedEnv, command_name: str) -> torch.Tensor:
     """The reference contact point carried onto the *actual* object pose, in the robot heading frame.
 
     This is what closes the loop for grasping: if the object has been knocked out of place, the target moves
-    with it instead of pointing at where the reference thought it would be.
+    with it instead of pointing at where the reference thought it would be. Scaled onto the resized box, like
+    the interaction reward's target, since this reads the simulated object too.
     """
     command = _command(env, command_name)
     points = _object_points_w(
         command.robot_object_pos_w,
         command.robot_object_quat_w,
-        command.contact_point_local[command.reference_frames(0)],
+        command.contact_point_local_scaled(command.reference_frames(0)),
     )
     rel = points - command.robot_anchor_pos_w[:, None, :]
     return rotate_into_heading(command.robot_anchor_quat_w, rel).reshape(env.num_envs, -1)

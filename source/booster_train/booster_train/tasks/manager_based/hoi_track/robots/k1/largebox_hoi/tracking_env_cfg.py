@@ -51,9 +51,14 @@ HAND_CONTACT_FORCE_THRESHOLD = 0.1
 # A harder force landscape (20 N / sigma 30) was tried and did not raise force: on sub1_suitcase_029 r_F fell
 # 0.84 -> 0.61 and gated contact 22% -> 13%, with force flat at ~5 N. Back to HDMI's 10 / 40; the push for more
 # grip now comes from CONTACT_GAIN instead.
-CONTACT_REWARD_FORCE_THRESHOLD = 10.0
+# Now 15 N / sigma 10, pushing for a firmer grip than the ~6.6 N the 75k checkpoint holds with. At that force
+# r_F drops 0.92 -> 0.43 against the old 10 / 40, and a hand on its contact point but not pressing earns 0.22
+# of the gated reward instead of 0.78, so force now weighs heavily against position during the approach too.
+# Interaction/contact_frac counts frames above this threshold, so it reads lower than in earlier runs;
+# Interaction/force (Newtons) is the curve comparable across the change.
+CONTACT_REWARD_FORCE_THRESHOLD = 15.0
 CONTACT_SIGMA_P = 0.3
-CONTACT_SIGMA_F = 40.0
+CONTACT_SIGMA_F = 10.0
 # Scales only the gated part of the interaction reward. Without it a single weight sets both the grasping
 # gradient and the flat (1 - gate) survival constant, and the constant wins: at 25k iterations 9.24 of the
 # 10.05 earned was the constant and 0.83 was grasping. Still true at gain 5: ~80% of the term was the constant
@@ -185,6 +190,55 @@ NO_OBJECT_PARK_OFFSET = (0.0, 0.0, 10.0)
 # 0.3-0.6 with every other body, so the effective floor was that range, not 1.0.
 GROUND_FRICTION_RANGE = (0.5, 2.0)
 
+# Actuator randomization (mdp.randomize_actuator_dr), once per episode. Hardware logs fit the PD law poorly at the
+# ankles (r ~ 0.5-0.7) and the feet rock in the stance hold, while training had nominal gains, full strength and
+# zero joint friction. Kp is skewed below 1 (0.6 + 0.6 * Beta(2.5, 2), mean ~0.93): the real joints track softer
+# than nominal far more often than stiffer. Strength scales the PD torque and its limit together. Friction is in
+# Nm / Nm*s/rad, applied inside the actuator (PhysX joint friction is a unitless coefficient); the K1 ankle is
+# modelled serially, so the ankle values sit on Ankle_Pitch/Roll rather than on motor-side joints.
+ACTUATOR_KP_BETA = (2.5, 2.0)
+ACTUATOR_KP_RANGE = (0.6, 1.2)
+ACTUATOR_KD_RANGE = (0.7, 1.3)
+MOTOR_STRENGTH_RANGE = (0.8, 1.2)
+JOINT_FRICTION_MAX = {  # joint-name regex -> (static Nm, viscous Nm*s/rad) upper bounds, drawn U(0, max) per joint
+    ".*_Ankle_.*": (1.5, 0.3),
+    ".*_(Hip|Knee)_.*": (1.0, 0.3),
+    ".*_(Shoulder|Elbow)_.*|.*Head.*": (0.3, 0.1),
+}
+# Armature +-20% per joint. Startup, not reset: Isaac Lab writes armature through a CPU call.
+JOINT_ARMATURE_SCALE = (0.8, 1.2)
+
+# Flat-foot stance penalty (FootFlatStance): four sole corners of each *simulated* stance foot, judged against the
+# floor, not against the reference -- whose own stance feet are rolled onto the inner edge and hover ~1 cm, scoring
+# only 0.1-0.3 on this measure. The weight is the stance-frame gain (the term is 0 on swing feet). Corner offsets,
+# tol and sigma are the tracker-side values, checked against meshes/Left_Foot.STL.
+#
+# Was -20 / sigma 15 mm: over the first ~2k iterations of the sub03 fine-tune the score sat at ~0.2, with stance
+# corners at 23 / 1 / 38 / 15 mm (toe-out / toe-in / heel-out / heel-in) -- deep in the exp's flat tail (a typical
+# foot scored ~0.001 there), so lowering a corner by a few mm earned almost nothing. 30 mm puts that same foot at
+# ~0.16, where the slope is real, and -40 doubles what is paid for it.
+FOOT_FLAT_WEIGHT = -40.0
+# Horizontal feet / knee (shank origin) spacing bands for ULTRA's distance penalties, zero inside. ULTRA's [0.25, 0.65]
+# is for a larger robot; the baked K1 references use feet 0.14-0.40 m (boxlarge 0.19-0.34, largebox 0.16-0.40,
+# suitcase 0.14-0.33) and knees 0.17-0.33 m, and the boxlarge settle ends at 0.24 m. These bands sit a few cm outside
+# every reference, so tracking the motion never pays; they only fire when feet/knees close in or splay well past it.
+FEET_DISTANCE_RANGE = (0.12, 0.45)
+KNEE_DISTANCE_RANGE = (0.14, 0.38)
+FOOT_FLAT_TOL = 0.004  # m; corner lift ignored below this
+FOOT_FLAT_SIGMA = 0.03  # m; score exp(-sum(lift^2) / sigma^2), so one corner up 34 mm -> 0.28
+
+# CoP support-centering penalty (CoPSupportCentering): the global centre of pressure, force-weighted over both
+# feet's ground contacts, is penalized for drifting off the sole-centre midpoint of whichever feet the
+# *reference* has in stance right now -- support geometry and CoP both come from the simulated robot, only the
+# stance label comes from the reference. Free-radius/scale picked from play.py --overlay_cop measurements on two
+# already-decent checkpoints (sub3 model_36000, sub1 model_70000): mean CoP-to-support distance 6.2 / 7.2 cm,
+# p90 13.1 / 12.5 cm over ~485 loaded steps each. 0.05 m sits below that mean, so there is real gradient without
+# forcing the CoP to the exact centre immediately; `scale` normalizes the metre-scale excess to an O(1) penalty
+# comparable to the other terms once weighted.
+COP_FREE_RADIUS = 0.05
+COP_SCALE = 0.05
+COP_MIN_LOAD = 5.0
+
 
 @configclass
 class MySceneCfg(InteractiveSceneCfg):
@@ -233,6 +287,16 @@ class MySceneCfg(InteractiveSceneCfg):
         prim_path="{ENV_REGEX_NS}/Robot/right_hand_link",
         filter_prim_paths_expr=[OBJECT_CONTACT_FILTER],
         history_length=8,
+    )
+    # Feet against the ground collider, with per-contact points so CoPSupportCentering can force-weight them
+    # into a real centre of pressure (ContactSensorData.contact_pos_w is an unweighted mean, insufficient here).
+    # The plane prim is fixed by Isaac Lab's grid ground-plane asset. Same config play.py's --overlay_cop uses,
+    # made permanent here rather than added ad hoc, so training and render-time numbers agree.
+    foot_ground_contact = ContactSensorCfg(
+        prim_path="{ENV_REGEX_NS}/Robot/.*_foot_link",
+        filter_prim_paths_expr=["/World/ground/terrain/GroundPlane/CollisionPlane"],
+        track_contact_points=True,
+        max_contact_data_count_per_prim=32,
     )
 
 
@@ -399,6 +463,30 @@ class EventCfg:
             "mass_distribution_params": (-3.0, 3.0),
             "operation": "add",
             "recompute_inertia": True,
+        },
+    )
+
+    # Kp / Kd / strength / joint friction per episode; see the ACTUATOR_* constants. Play configs turn it off.
+    actuator_dr = EventTerm(
+        func=mdp.randomize_actuator_dr,
+        mode="reset",
+        params={
+            "kp_beta": ACTUATOR_KP_BETA,
+            "kp_range": ACTUATOR_KP_RANGE,
+            "kd_range": ACTUATOR_KD_RANGE,
+            "strength_range": MOTOR_STRENGTH_RANGE,
+            "friction_max": JOINT_FRICTION_MAX,
+        },
+    )
+
+    joint_armature = EventTerm(
+        func=mdp.randomize_joint_parameters,
+        mode="startup",
+        params={
+            "asset_cfg": SceneEntityCfg("robot", joint_names=[".*"]),
+            "armature_distribution_params": JOINT_ARMATURE_SCALE,
+            "operation": "scale",
+            "distribution": "uniform",
         },
     )
 
@@ -620,46 +708,83 @@ class RewardsCfg:
         weight=-1.0,
         params={"asset_cfg": SceneEntityCfg("robot")},
     )
+    # ULTRA's base angular velocity penalty (-0.01 there; 50x here, like the other regularizers). It damps steady trunk
+    # rocking, which base_ang_vel_change_l2 (jerks only) does not. The references themselves average
+    # ||omega||^2 ~1.0-1.2 (peaks 5-8 while bending), so tracking them costs ~0.5 per step.
+    base_ang_vel_l2 = RewTerm(
+        func=mdp.base_ang_vel_l2,
+        weight=-0.5,
+        params={"asset_cfg": SceneEntityCfg("robot")},
+    )
+    # ULTRA's base linear velocity penalty, ||v|| unsquared (-0.1 there; 50x here). It pushes against the reference's
+    # own trunk motion: the references average 0.13 m/s (sub03) / 0.27 m/s (sub3), peaking 0.56 / 0.90 while
+    # bending, so tracking them costs ~0.7-1.3 per step. If motion_body_lin_vel or motion_body_pos sag, lower it.
+    base_lin_vel = RewTerm(
+        func=mdp.base_lin_vel_norm,
+        weight=-5.0,
+        params={"asset_cfg": SceneEntityCfg("robot")},
+    )
     joint_vel_l2 = RewTerm(
         func=mdp.joint_vel_l2,
         weight=-1e-2,
         params={"asset_cfg": SceneEntityCfg("robot", joint_names=[".*"])},
     )
-    # ULTRA's foot terms; the weights are ours. The clips' feet are not flat -- sub3_largebox_003 holds them
-    # rolled ~22 deg onto their edges through the final hold, a retargeting artifact -- and feet_orientation pulls
-    # them flat anyway. How far it gets depends on the orientation term it fights: against a full-orientation
-    # motion_foot_ori (15, std 0.2) a -10 penalty bought ~1 deg of flattening, while against the split's loose
-    # tilt (5, std 0.5) -20 was expected to flatten ~12 of ~18 deg. motion_foot_ori is back at 20 / std 0.2, so
-    # expect the feet to follow the clip's roll again; restore the split below to flatten them.
+    # ULTRA's foot & stability penalties (all but swing clearance and stand-on-feet, which foot_flat_stance already
+    # covers with real stance labels). Weights follow this repo's scaling of ULTRA rather than its raw table: at
+    # ULTRA's own values its regularizers were ~0.03% of our positive reward and never moved anything.
     #
-    # Off for now, with motion_foot_ori back at full strength the two would only fight. Kept for reference; replace
-    # the None with this (and restore the split) to flatten the feet again.
-    # feet_orientation = RewTerm(
-    #     func=mdp.feet_orientation_l2,
-    #     weight=-20.0,
-    #     params={"asset_cfg": SceneEntityCfg("robot", body_names=["left_foot_link", "right_foot_link"])},
-    # )
-    feet_orientation = None
-    # Off. Kept for reference; replace the None with this to turn it back on.
-    # feet_stumble = RewTerm(
-    #     func=mdp.feet_stumble,
-    #     weight=-10.0,
-    #     params={
-    #         "sensor_cfg": SceneEntityCfg("contact_forces", body_names=["left_foot_link", "right_foot_link"]),
-    #         "ratio": 4.0,
-    #     },
-    # )
-    feet_stumble = None
+    # feet_orientation overlaps foot_flat_stance on stance feet; what it adds is keeping swing feet level too.
+    feet_orientation = RewTerm(
+        func=mdp.feet_orientation_l2,
+        weight=-20.0,
+        params={"asset_cfg": SceneEntityCfg("robot", body_names=["left_foot_link", "right_foot_link"])},
+    )
+    feet_stumble = RewTerm(
+        func=mdp.feet_stumble,
+        weight=-10.0,
+        params={
+            "sensor_cfg": SceneEntityCfg("contact_forces", body_names=["left_foot_link", "right_foot_link"]),
+            "ratio": 4.0,
+        },
+    )
+    # A planted foot sliding or twisting under load: horizontal foot speed while the sim foot is in contact.
+    foot_slip = RewTerm(
+        func=mdp.feet_slip,
+        weight=-10.0,
+        params={
+            "sensor_cfg": SceneEntityCfg("contact_forces", body_names=["left_foot_link", "right_foot_link"]),
+            "asset_cfg": SceneEntityCfg("robot", body_names=["left_foot_link", "right_foot_link"]),
+        },
+    )
+    feet_distance = RewTerm(
+        func=mdp.body_pair_distance_out_of_range,
+        weight=-10.0,
+        params={
+            "asset_cfg": SceneEntityCfg("robot", body_names=["left_foot_link", "right_foot_link"]),
+            "min_dist": FEET_DISTANCE_RANGE[0],
+            "max_dist": FEET_DISTANCE_RANGE[1],
+        },
+    )
+    knee_distance = RewTerm(
+        func=mdp.body_pair_distance_out_of_range,
+        weight=-10.0,
+        params={
+            "asset_cfg": SceneEntityCfg("robot", body_names=["Left_Shank", "Right_Shank"]),
+            "min_dist": KNEE_DISTANCE_RANGE[0],
+            "max_dist": KNEE_DISTANCE_RANGE[1],
+        },
+    )
     # Off for the HOI task. It penalises contact on every body but the feet, using the *unfiltered*
     # contact_forces sensor, so a hand pressing on the object earns the interaction reward and is fined -10 for
     # touching anything at the same time -- the two terms directly cancel. Re-enable with the hands excluded
     # from body_names if the robot needs a penalty for faceplanting.
     undesired_contacts = None
-    # Foot orientation and position, both at 20: back to the tracker's single full-orientation term (std 0.2),
-    # between largebox_tracker's 15 (ori) / 30 (pos) and this task's previous 15 / 15.
+    # Foot orientation at 10, position at 20. Orientation was 20 until foot_flat_stance below: the reference's own
+    # stance feet are rolled onto their inner edge (outer corners 15-25 mm up), so full-weight orientation tracking
+    # holds the robot on exactly the rolled edge that penalty asks it to put down.
     motion_foot_ori = RewTerm(
         func=mdp.motion_relative_body_orientation_error_exp,
-        weight=20.0,
+        weight=10.0,
         params={"command_name": "motion", "std": 0.2, "body_names": ["left_foot_link", "right_foot_link"]},
     )
     # Previous split, kept for reference: heading tracked as tightly as the full term, tilt only loosely (std 0.5
@@ -681,6 +806,36 @@ class RewardsCfg:
         weight=20.0,
         params={"command_name": "motion", "std": 0.2, "body_names": ["left_foot_link", "right_foot_link"]},
     )
+
+    # Flat-foot penalty on reference stance frames: 0 with all four sole corners within FOOT_FLAT_TOL of the floor,
+    # -> 1 per stance foot up on a heel, toe or edge (see mdp.FootFlatStance). The weight is the stance-frame gain:
+    # the term is exactly 0 on swing feet, so there is no out-of-gate constant to scale against. At 40 a fully
+    # rolled stance foot costs four times what motion_foot_ori (10) pays at most, so flat feet win over the roll.
+    foot_flat_stance = RewTerm(
+        func=mdp.FootFlatStance,
+        weight=FOOT_FLAT_WEIGHT,
+        params={"command_name": "motion", "tol": FOOT_FLAT_TOL, "sigma": FOOT_FLAT_SIGMA},
+    )
+
+    # Support-centering penalty, distinct from motion_foot_pos/_ori above: those pull each foot onto the
+    # reference's own foot pose, while this only checks whether the robot's own force-weighted CoP sits under
+    # its own stance foot/feet -- the reference contributes just a per-foot in-stance label. Dead zone inside
+    # COP_FREE_RADIUS, so ordinary sway costs nothing; not gated by object-absence, since balance still matters
+    # in drop/no-object scenarios. See COP_* constants above for where the numbers came from.
+    # Off for now: its effect at -1 was unclear, and foot_flat_stance now addresses heel/toe/edge loading directly.
+    # Restore the block below to re-enable; the foot_ground_contact sensor stays in the scene for --overlay_cop.
+    # cop_support = RewTerm(
+    #     func=mdp.CoPSupportCentering,
+    #     weight=-1.0,
+    #     params={
+    #         "command_name": "motion",
+    #         "sensor_name": "foot_ground_contact",
+    #         "free_radius": COP_FREE_RADIUS,
+    #         "scale": COP_SCALE,
+    #         "min_load": COP_MIN_LOAD,
+    #     },
+    # )
+    cop_support = None
 
     motion_hand_ori = RewTerm(
         func=mdp.motion_relative_body_orientation_error_exp,

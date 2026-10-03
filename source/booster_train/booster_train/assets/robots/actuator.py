@@ -102,6 +102,34 @@ class BoosterDelayedPDActuator(DelayedPDActuator):
         v_knee = self.knee_point_velocity
         v_max = self.velocity_limit
         self._denom = (v_max - v_knee).clamp(min=1e-6)
+        # Per-env actuator domain randomization, written by mdp.events.randomize_actuator_dr. Nominal until then:
+        # gains at their configured values, strength 1, no joint friction.
+        self._kp_nominal = self.stiffness.clone()
+        self._kd_nominal = self.damping.clone()
+        self.dr_strength = torch.ones(self._num_envs, 1, device=self._device)
+        self.dr_static_friction = torch.zeros_like(self.computed_effort)
+        self.dr_viscous_friction = torch.zeros_like(self.computed_effort)
+
+    def set_dr(
+        self,
+        env_ids: torch.Tensor,
+        kp_scale: torch.Tensor,
+        kd_scale: torch.Tensor,
+        strength: torch.Tensor,
+        static_friction: torch.Tensor,
+        viscous_friction: torch.Tensor,
+    ) -> None:
+        """Set one episode's actuator randomization for ``env_ids``: gain scales and strength ``(n,)``, friction
+        ``(n, num_joints)`` in Nm and Nm*s/rad. Gains scale the *nominal* values, so repeated calls do not compound."""
+        self.stiffness[env_ids] = self._kp_nominal[env_ids] * kp_scale[:, None]
+        self.damping[env_ids] = self._kd_nominal[env_ids] * kd_scale[:, None]
+        self.dr_strength[env_ids] = strength[:, None]
+        self.dr_static_friction[env_ids] = static_friction
+        self.dr_viscous_friction[env_ids] = viscous_friction
+
+    # Velocity scale of the smooth Coulomb term: tanh(v / FRICTION_VEL_EPS). A hard sign() chatters at the 5 ms
+    # physics step around zero velocity; at 0.1 rad/s the full static friction is reached by ~0.2 rad/s.
+    FRICTION_VEL_EPS = 0.1
 
     def compute(
         self, control_action: ArticulationActions, joint_pos: torch.Tensor, joint_vel: torch.Tensor
@@ -109,7 +137,14 @@ class BoosterDelayedPDActuator(DelayedPDActuator):
         # Cache measured joint velocity for speed-based torque clipping.
         self._joint_vel[:] = joint_vel
         # Apply delay using the base implementation.
-        return super().compute(control_action, joint_pos, joint_vel)
+        control_action = super().compute(control_action, joint_pos, joint_vel)
+        # Joint friction (static + viscous), opposing the measured joint velocity. Modelled here, in Nm, rather than
+        # through PhysX's joint friction, which is a coefficient on the transmitted joint force and has no Nm value.
+        # Applied after the motor clip: it acts at the joint, not through the motor's torque limit.
+        friction = self.dr_static_friction * torch.tanh(joint_vel / self.FRICTION_VEL_EPS) + self.dr_viscous_friction * joint_vel
+        self.applied_effort = self.applied_effort - friction
+        control_action.joint_efforts = self.applied_effort
+        return control_action
 
     def _clip_effort(self, effort: torch.Tensor) -> torch.Tensor:
         # Piecewise-linear T-N curve using existing limits:
@@ -130,7 +165,9 @@ class BoosterDelayedPDActuator(DelayedPDActuator):
         max_effort = torch.where(non_finite_vmax, tau_max, max_effort)
         max_effort = torch.where(non_positive_vmax, torch.zeros_like(max_effort), max_effort)
 
-        return torch.clip(effort, min=-max_effort, max=max_effort)
+        # Motor strength: scale the PD torque, then clip at the equally scaled limit, so the cap moves with strength.
+        s = self.dr_strength
+        return torch.clip(s * effort, min=-s * max_effort, max=s * max_effort)
 
 
 @configclass

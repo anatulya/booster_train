@@ -7,7 +7,7 @@ classes change is which observation group the actor reads.
 
 from isaaclab.utils import configclass
 
-from ..largebox_hoi.env_cfg import ALL_MOTION_FILES, FlatEnvCfg, clip_tag
+from ..largebox_hoi.env_cfg import ALL_MOTION_FILES, FlatEnvCfg, apply_clip_overrides, clip_tag
 from .tracking_env_cfg import AsymObservationsCfg
 
 
@@ -25,6 +25,10 @@ class PlayFlatAsymEnvCfg(FlatAsymEnvCfg):
         # In play mode each env starts at the first frame of a different clip, so one run shows every motion.
         self.commands.motion.play = True
         self.events.push_robot = None
+        # Nominal actuators (gains x1, full strength, no joint friction, default armature); play.py
+        # --actuator_stress restores actuator_dr with fixed worst-case values.
+        self.events.actuator_dr = None
+        self.events.joint_armature = None
         self.events.push_object = None
         self.events.object_scenario = None
         # No reset jitter either: a re-placed robot would otherwise start each rollout with a random kick and offset.
@@ -66,10 +70,11 @@ for _tag, _path in SINGLE_CLIP_FILES.items():
     for _base in (FlatAsymEnvCfg, PlayFlatAsymEnvCfg):
         _name = f"{_base.__name__}_{_tag}"
 
-        def _post_init(self, _base=_base, _path=_path):
+        def _post_init(self, _base=_base, _path=_path, _tag=_tag):
             _base.__post_init__(self)
             self.commands.motion.motion_file = _path
             self.set_object_from_motion()  # this clip may use a different object than the multi-clip default
+            apply_clip_overrides(self, _tag)
 
         _cls = type(_name, (_base,), {"__post_init__": _post_init, "__module__": __name__, "__qualname__": _name})
         globals()[_name] = configclass(_cls)
